@@ -38,7 +38,9 @@ object ShotCalculator {
         fun distanceTo(other: Point): Float = hypot(other.x - x, other.y - y)
     }
 
-    data class Pocket(val x: Float, val y: Float, val name: String)
+    data class Pocket(val x: Float, val y: Float, val name: String) {
+        fun toPoint(): Point = Point(x, y)
+    }
 
     /** Result of one candidate shot — direct or bank. */
     sealed class Shot {
@@ -221,7 +223,7 @@ object ShotCalculator {
                 if (toPocketX * toImpactX + toPocketY * toImpactY <= 0f) return@forEach
 
                 // Skip if bank point too close to a pocket (degenerate / basically direct).
-                val nearPocket = pockets.any { pk -> pk.distanceTo(hit) < 10f }
+                val nearPocket = pockets.any { pk -> pk.toPoint().distanceTo(hit) < 10f }
                 if (nearPocket) return@forEach
 
                 results += Shot.Bank(
