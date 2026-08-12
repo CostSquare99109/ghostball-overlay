@@ -4,15 +4,13 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Cue ball (white) -->
-    <circle
-        android:cx="54"
-        android:cy="54"
-        android:r="28"
+    <!-- Cue ball (white) - circle as path -->
+    <path
         android:fillColor="#FFFFFF"
         android:strokeColor="#333333"
-        android:strokeWidth="1.5" />
-    <!-- Ghost ball (dashed outline) -->
+        android:strokeWidth="1.5"
+        android:pathData="M54,26 a28,28 0 1,1 0,56 a28,28 0 1,1 0,-56" />
+    <!-- Ghost ball (dashed outline) - circle as path -->
     <path
         android:fillColor="@android:color/transparent"
         android:strokeColor="#E0E0E0"
@@ -26,12 +24,10 @@
         android:strokeWidth="2"
         android:pathData="M54,54 L14,54"
         android:strokeLineCap="round" />
-    <!-- Object ball (yellow) at right -->
-    <circle
-        android:cx="94"
-        android:cy="54"
-        android:r="10"
+    <!-- Object ball (yellow) at right - circle as path -->
+    <path
         android:fillColor="#FFCF3F"
         android:strokeColor="#7A5C00"
-        android:strokeWidth="1.2" />
+        android:strokeWidth="1.2"
+        android:pathData="M94,44 a10,10 0 1,1 0,20 a10,10 0 1,1 0,-20" />
 </vector>
