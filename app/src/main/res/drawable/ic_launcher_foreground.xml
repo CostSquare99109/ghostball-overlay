@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Cue ball (white) -->
+    <circle
+        android:cx="54"
+        android:cy="54"
+        android:r="28"
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#333333"
+        android:strokeWidth="1.5" />
+    <!-- Ghost ball (dashed outline) -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#E0E0E0"
+        android:strokeWidth="1.8"
+        android:pathData="M54,14 a40,40 0 1,1 0,80 a40,40 0 1,1 0,-80"
+        android:strokeLineCap="round" />
+    <!-- Aim line: cue -> ghost -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#C9A227"
+        android:strokeWidth="2"
+        android:pathData="M54,54 L14,54"
+        android:strokeLineCap="round" />
+    <!-- Object ball (yellow) at right -->
+    <circle
+        android:cx="94"
+        android:cy="54"
+        android:r="10"
+        android:fillColor="#FFCF3F"
+        android:strokeColor="#7A5C00"
+        android:strokeWidth="1.2" />
+</vector>

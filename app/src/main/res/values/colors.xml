@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="background">#14100c</color>
+    <color name="chalk">#eae3d3</color>
+    <color name="gold">#c9a227</color>
+    <color name="orange">#ff8c42</color>
+    <color name="felt_dark">#073e28</color>
+    <color name="white_ball">#f4f4f4</color>
+    <color name="object_ball">#ffcf3f</color>
+</resources>

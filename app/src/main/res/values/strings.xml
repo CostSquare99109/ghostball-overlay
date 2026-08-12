@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Ghost Ball Overlay</string>
+    <string name="notif_channel_overlay">Overlay activo</string>
+    <string name="notif_title">Bola fantasma activo</string>
+    <string name="notif_text">Toca el botón flotante para dibujar</string>
+</resources>
