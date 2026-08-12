@@ -119,11 +119,13 @@ class ShotCalculatorTest {
         // Need pocket such that cue→obj = (100, 0) and obj→pocket has very small x component.
         // To get ~80°: cos(80°) = 0.1736. x/sqrt(x²+y²) = 0.1736 → y ≈ 5.67*x
         // Pick x = 10, y = 57 → pocket = (210, 157).
+        // BUT object is at x=200, table width=400, so object is near RIGHT rail (x=400).
+        // A right-rail bank would be degenerate (tiny angle). Use a wider table so object is centered.
         val cue = p(100f, 100f)
-        val obj = p(200f, 100f)
-        val pocket = pk(210f, 157f)
+        val obj = p(250f, 100f)  // Centered in a 600-wide table
+        val pocket = pk(260f, 157f)  // x=260 (small x diff), y=157
 
-        val table = table(400f, 200f)
+        val table = table(600f, 200f)
         val shots = ShotCalculator.compute(cue, obj, listOf(pocket), table)
         assertFalse("Should still produce a shot even for extreme cut", shots.isEmpty())
 
@@ -171,12 +173,13 @@ class ShotCalculatorTest {
 
     @Test
     fun bankImpactInsideTableBounds() {
-        // Cue near left (50, 100), object center (150, 100), pocket top-right (280, 20).
-        // Bank off LEFT rail (x=0): mirror pocket across x=0 → (-280, 20).
-        // Line obj(150,100) → mirror(-280,20) crosses x=0 at some y.
+        // Cue near left (50, 100), object center (150, 100), pocket TOP-LEFT (20, 20).
+        // Bank off LEFT rail (x=0): mirror pocket across x=0 → (-20, 20).
+        // Line obj(150,100) → mirror(-20,20) crosses x=0 at some y.
+        // Vector obj→pocket = (-130, -80). obj→impact should be in similar direction.
         val cue = p(50f, 100f)
         val obj = p(150f, 100f)
-        val pocket = pk(280f, 20f)
+        val pocket = pk(20f, 20f)  // Top-left corner - makes sense for LEFT rail bank
 
         val table = table(300f, 200f)
         val shots = ShotCalculator.compute(cue, obj, listOf(pocket), table)
