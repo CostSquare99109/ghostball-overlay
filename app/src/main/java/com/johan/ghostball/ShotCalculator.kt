@@ -14,8 +14,10 @@ import kotlin.math.sqrt
  *    the object ball would travel toward the pocket.
  *  - Bank shots: reflect the pocket across one rail and use the reflected target as a
  *    pseudo-pocket; the real rail hit point is the intersection of O→T' with that rail.
- *  - Scoring: angle of cut in degrees, plus a 10° penalty for bank shots so direct
- *    shots are preferred when angles are within ~10° of each other.
+ *    Only banks where the impact point lies *between* object and reflected pocket AND
+ *    the object→impact vector points generally toward the real pocket are kept.
+ *  - Scoring: angle of cut in degrees, plus a [BANK_PENALTY] for bank shots so direct
+ *    shots are preferred when angles are within the penalty margin.
  *
  * **Units.** Everything is in the same unit as the screen coordinates fed in
  * (pixels, cm, or arbitrary — `BALL_RADIUS` is the same unit). Coordinates are
@@ -26,10 +28,10 @@ object ShotCalculator {
     /** Reference ball radius. Caller can override via [compute]. */
     const val DEFAULT_BALL_RADIUS: Float = 2.85f
 
-    /** Penalty added to bank-shot score so direct shots are preferred when tied within ~10°. */
-    const val BANK_PENALTY: Float = 10f
+    /** Penalty added to bank-shot score so direct shots are preferred when tied within ~20°. */
+    const val BANK_PENALTY: Float = 20f
 
-    /** Cards that the mirror/intersection produces a bank hit point inside the table. */
+    /** Epsilon for geometric comparisons. */
     private const val EPS: Float = 1e-6f
 
     data class Point(val x: Float, val y: Float) {
@@ -176,7 +178,8 @@ object ShotCalculator {
         }
 
         // 2) Bank shots — reflect every pocket across every rail, find the rail
-        //    intersection, keep it only if it lies inside the table.
+        //    intersection, keep it only if it lies inside the table AND the impact
+        //    point is in the general direction from object toward the real pocket.
         val rails = if (maxBounces >= 1) Rail.values().toList() else emptyList()
         pockets.forEach { pocket ->
             rails.forEach { rail ->
@@ -190,6 +193,7 @@ object ShotCalculator {
                         if (mirror.y == obj.y) null
                         else {
                             val t = (railY - obj.y) / (mirror.y - obj.y)
+                            // Impact must be strictly between object and mirror (0 < t < 1).
                             if (t <= EPS || t >= 1f - EPS) null
                             else Point(obj.x + t * (mirror.x - obj.x), railY)
                         }
@@ -207,6 +211,18 @@ object ShotCalculator {
 
                 val hit = impact ?: return@forEach
                 if (!table.contains(hit)) return@forEach
+
+                // Direction filter: object→impact vector must have positive dot product
+                // with object→real-pocket vector. Rejects banks that go "away" first.
+                val toPocketX = pocket.x - obj.x
+                val toPocketY = pocket.y - obj.y
+                val toImpactX = hit.x - obj.x
+                val toImpactY = hit.y - obj.y
+                if (toPocketX * toImpactX + toPocketY * toImpactY <= 0f) return@forEach
+
+                // Skip if bank point too close to a pocket (degenerate / basically direct).
+                val nearPocket = pockets.any { pk -> pk.distanceTo(hit) < 10f }
+                if (nearPocket) return@forEach
 
                 results += Shot.Bank(
                     pocket = pocket,

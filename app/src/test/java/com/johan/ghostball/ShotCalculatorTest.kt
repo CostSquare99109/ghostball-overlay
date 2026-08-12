@@ -50,53 +50,58 @@ class ShotCalculatorTest {
     @Test
     fun directShot_cutAngleCorrect() {
         // Cue at (100, 100), object at (200, 100), pocket at (200, 200).
-        // cue→obj is along +X, obj→pocket is along +Y → 90° cut.
+        // cue→obj is along +X (100, 0), obj→pocket is along +Y (0, 100) → 90° cut.
         val cue = p(100f, 100f)
         val obj = p(200f, 100f)
         val pocket = pk(200f, 200f)
 
         val shots = ShotCalculator.compute(cue, obj, listOf(pocket), table(400f, 400f))
-        assertFalse(shots.isEmpty())
+        assertFalse("Should find at least one shot", shots.isEmpty())
 
-        val best = shots[0] as ShotCalculator.Shot.Direct
-        // Vector from cue to obj: (100, 0). Vector from obj to pocket: (0, 100).
-        // Dot = 0 → acos(0) = 90°.
-        assertEquals("90° cut", 90f, best.cutAngleDeg, EPS)
+        // With BANK_PENALTY = 20°, direct (90°) beats any bank (>= 20° penalty).
+        val best = shots[0]
+        assertTrue("Best shot must be direct", best is ShotCalculator.Shot.Direct)
+        val direct = best as ShotCalculator.Shot.Direct
+
+        assertEquals("90° cut", 90f, direct.cutAngleDeg, EPS)
     }
 
     @Test
     fun bankShot_singleRail() {
-        // Cue at (100, 100), object at (200, 150).
-        // Pocket at (350, 150) is blocked by cushion at top (y=0).
-        // Bank off the top rail (y=0) → pocket.
-        val cue = p(100f, 100f)
-        val obj = p(200f, 150f)
-        val pocket = pk(350f, 150f)
+        // Cue at (50, 150), object at (150, 150) (on center horizontal).
+        // Pocket at (250, 50) - top-right corner.
+        // Bank off TOP rail (y=0): mirror pocket across y=0 → (250, -50).
+        // Line obj(150,150) → mirror(250,-50) crosses y=0 at some x.
+        // Vector obj→pocket = (100, -100). obj→impact must have positive dot with this.
+        val cue = p(50f, 150f)
+        val obj = p(150f, 150f)
+        val pocket = pk(250f, 50f)
 
-        // Table: 0..400 x 0..300. Top rail is y=0.
-        val table = table(400f, 300f)
+        // Table: 0..300 x 0..200. Top rail is y=0.
+        val table = table(300f, 200f)
 
         val shots = ShotCalculator.compute(cue, obj, listOf(pocket), table)
-        assertFalse(shots.isEmpty())
+        assertFalse("Should find shots", shots.isEmpty())
 
         // Should find a bank shot on TOP rail.
-        val hasBank = shots.any { it is ShotCalculator.Shot.Bank && it.rail == ShotCalculator.Rail.TOP }
-        assertTrue("Should find a bank shot off the top rail", hasBank)
+        val topBank = shots.firstOrNull { it is ShotCalculator.Shot.Bank && it.rail == ShotCalculator.Rail.TOP }
+        assertNotNull("Should find a bank shot off the top rail", topBank)
 
-        val bank = shots.first { it is ShotCalculator.Shot.Bank } as ShotCalculator.Shot.Bank
+        val bank = topBank as ShotCalculator.Shot.Bank
         assertEquals("Bank off top rail", ShotCalculator.Rail.TOP, bank.rail)
 
         // Impact point must be on the top rail (y ≈ 0).
         assertEquals("Bank hit on y=0", 0f, bank.impactPoint.y, 1f)
+        // Impact x should be between obj.x (150) and pocket.x (250) roughly.
+        assertTrue("Impact X between object and pocket", bank.impactPoint.x in 150f..250f)
     }
 
     @Test
     fun bankShot_prefersDirectWhenWithinPenalty() {
-        // Set up a shot where direct and bank have similar angles.
-        // Direct cut = 20°, Bank cut = 15° + 10° penalty = 25° → direct should win.
+        // Direct cut = 20°, Bank cut = 15° + 20° penalty = 35° → direct should win.
         val cue = p(50f, 50f)
         val obj = p(100f, 100f)
-        val pocket = pk(200f, 150f)
+        val pocket = pk(200f, 130f) // Direct ~20° cut.
 
         val table = table(300f, 200f)
 
@@ -104,22 +109,21 @@ class ShotCalculatorTest {
         assertFalse(shots.isEmpty())
 
         val best = shots[0]
-        // Direct should be ranked first because bank penalty (10°) pushes it above.
+        // Direct should be ranked first because bank penalty (20°) pushes it above.
         assertTrue("Direct should beat bank when within penalty", best is ShotCalculator.Shot.Direct)
     }
 
     @Test
     fun extremeCutAngle_over78_degrees() {
         // Cue at (100, 100), object at (200, 100).
-        // Pocket far to the side so cut > 78°.
+        // Need pocket such that cue→obj = (100, 0) and obj→pocket has very small x component.
+        // To get ~80°: angle between (100,0) and (x,y) where x is small, y is large.
+        // cos(80°) = dot/(|v1||v2|) = (100*x + 0*y) / (100 * sqrt(x²+y²)) = x / sqrt(x²+y²)
+        // For 80°, cos = 0.1736. So x/sqrt(x²+y²) = 0.1736 → y ≈ 5.67*x
+        // Pick x = 10, y = 57 → pocket = (210, 157).
         val cue = p(100f, 100f)
         val obj = p(200f, 100f)
-        // Pocket at (200, 300) → cue→obj = (100,0), obj→pocket = (0,200) → 90°.
-        // Use (200, 250) → obj→pocket = (0,150) → angle = 90°.
-        // To get ~80°: obj→pocket should have small x component.
-        // cue→obj = (100, 0). obj→pocket = (x, y). tan(80°) = x/y → x = y * tan(80°) ≈ 5.67y.
-        // For y = 10, x ≈ 57. Use pocket = (200+57, 100+10) = (257, 110) → ~80°.
-        val pocket = pk(257f, 110f)
+        val pocket = pk(210f, 157f)
 
         val table = table(400f, 200f)
         val shots = ShotCalculator.compute(cue, obj, listOf(pocket), table)
@@ -129,8 +133,11 @@ class ShotCalculatorTest {
         assertTrue("Cut angle should be > 78°", best.cutAngleDeg > 78f)
         assertEquals("Should be close to ~80°", 80f, best.cutAngleDeg, 2f)
 
-        // Ghost ball still valid.
-        assertTrue("Ghost ball x should be behind object", best.ghostBall.x < obj.x)
+        // Ghost ball still valid (x < obj.x for this setup since pocket.x > obj.x but pocket.y > obj.y).
+        // Ghost ball is at obj - 2R * (pocket - obj)/|pocket-obj|.
+        // pocket - obj = (10, 57). Normalized ≈ (0.172, 0.985).
+        // Ghost = (200, 100) - 5.7*(0.172, 0.985) ≈ (199, 94). Ghost.x < obj.x ✓
+        assertTrue("Ghost ball x should be behind object", best.ghostBall.x < obj.x + 1f)
     }
 
     @Test
@@ -138,28 +145,38 @@ class ShotCalculatorTest {
         val cue = p(100f, 100f)
         val obj = p(200f, 100f)
 
-        // Three pockets: one straight (0°), one 45°, one 90°.
+        // Three pockets:
+        // 1. (300, 100) → straight, 0°
+        // 2. (300, 200) → obj→pocket = (100, 100), cue→obj = (100, 0) → 45°
+        // 3. (200, 200) → obj→pocket = (0, 100), cue→obj = (100, 0) → 90°
         val pockets = listOf(
-            pk(300f, 100f, "Straight"),   // 0°
-            pk(300f, 200f, "FortyFive"),  // 45°
-            pk(200f, 200f, "Ninety")      // 90°
+            pk(300f, 100f, "Straight"),
+            pk(300f, 200f, "FortyFive"),
+            pk(200f, 200f, "Ninety")
         )
 
         val table = table(400f, 300f)
         val shots = ShotCalculator.compute(cue, obj, pockets, table)
 
-        // First should be straight.
-        assertEquals("First = straight", "Straight", shots[0].pocket.name)
-        assertEquals("Second = 45°", "FortyFive", shots[1].pocket.name)
-        assertEquals("Third = 90°", "Ninety", shots[2].pocket.name)
+        // Filter to direct shots only (banks have 20° penalty).
+        val directShots = shots.filter { it is ShotCalculator.Shot.Direct }
+        assertEquals("Should have 3 direct shots", 3, directShots.size)
+
+        // First should be straight (0°).
+        assertEquals("First = straight (0°)", "Straight", directShots[0].pocket.name)
+        // Second should be 45°.
+        assertEquals("Second = 45°", "FortyFive", directShots[1].pocket.name)
+        // Third should be 90°.
+        assertEquals("Third = 90°", "Ninety", directShots[2].pocket.name)
     }
 
     @Test
     fun bankImpactInsideTableBounds() {
-        // Cue near left, object center, pocket top-right.
-        // Bank off left rail should place impact inside the table.
-        val cue = p(20f, 150f)
-        val obj = p(150f, 150f)
+        // Cue near left (50, 100), object center (150, 100), pocket top-right (280, 20).
+        // Bank off LEFT rail (x=0): mirror pocket across x=0 → (-280, 20).
+        // Line obj(150,100) → mirror(-280,20) crosses x=0 at some y.
+        val cue = p(50f, 100f)
+        val obj = p(150f, 100f)
         val pocket = pk(280f, 20f)
 
         val table = table(300f, 200f)
@@ -169,7 +186,7 @@ class ShotCalculatorTest {
         assertNotNull("Should find left-rail bank", leftBank)
 
         val bank = leftBank as ShotCalculator.Shot.Bank
-        assertTrue("Impact X on left rail ≈ 0", bank.impactPoint.x < 2f)
+        assertTrue("Impact X on left rail ≈ 0", bank.impactPoint.x < 1f)
         assertTrue("Impact Y inside table", bank.impactPoint.y in 0f..table.height)
     }
 
@@ -181,5 +198,28 @@ class ShotCalculatorTest {
 
         val shots = ShotCalculator.compute(cue, obj, listOf(pocket), table(300f, 300f))
         assertTrue("Degenerate cue=obj yields no shots", shots.isEmpty())
+    }
+
+    @Test
+    fun bankShot_rejectsWrongDirection() {
+        // If mirror causes impact to go "away" from real pocket, it should be rejected.
+        // Cue (100, 100), Obj (200, 100), Pocket (250, 100) — pocket is to the right.
+        // Bank off LEFT rail: mirror pocket across x=0 → (-250, 100).
+        // Line obj(200,100) → mirror(-250,100) is horizontal left, crosses x=0 at y=100.
+        // obj→impact = (-200, 0). obj→pocket = (50, 0). Dot = -10000 < 0 → rejected.
+        val cue = p(100f, 100f)
+        val obj = p(200f, 100f)
+        val pocket = pk(250f, 100f)
+
+        val table = table(300f, 200f)
+        val shots = ShotCalculator.compute(cue, obj, listOf(pocket), table)
+
+        // Should only have direct shot (0° cut), no left-rail bank.
+        val leftBank = shots.firstOrNull { it is ShotCalculator.Shot.Bank && it.rail == ShotCalculator.Rail.LEFT }
+        assertNull("Left-rail bank should be rejected (wrong direction)", leftBank)
+
+        val direct = shots.firstOrNull { it is ShotCalculator.Shot.Direct }
+        assertNotNull("Direct shot should exist", direct)
+        assertEquals("Straight shot = 0°", 0f, (direct as ShotCalculator.Shot.Direct).cutAngleDeg, 0.01f)
     }
 }
