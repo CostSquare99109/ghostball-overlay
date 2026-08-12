@@ -161,13 +161,6 @@ Casos cubiertos:
 > Libre para usar, modificar, distribuir. Atribución apreciada.
 
 ---
-
-## Autor
-
-**Jhon Fredy Montalvo Cuadrado** (17 años, Carepa, Antioquia)  
-Estudiante Uniminuto — Proyecto de Vida NRC 1516/1520  
-GitHub: [@CostSquare99109](https://github.com/CostSquare99109)
-
 ---
 
 ## Pendientes / Roadmap
@@ -181,9 +174,3 @@ GitHub: [@CostSquare99109](https://github.com/CostSquare99109)
 - [ ] Tests de integración con Robolectric (OverlayView + Service).
 
 ---
-
-## Agradecimientos
-
-- Geometría de bola fantasma + espejo: billar clásico, implementación validada en prototipo HTML/JS previo.
-- Android `TYPE_APPLICATION_OVERLAY` + Foreground Service pattern.
-- CI inspirado en workflows previos del mismo autor (calculadora APK, descargador video).
