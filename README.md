@@ -46,9 +46,6 @@ cd ghostball-overlay
 ./gradlew assembleDebug
 # APK en: app/build/outputs/apk/debug/app-debug.apk
 ```
-
-> **Nota:** En Termux/Android (ARM64) el build local falla en AAPT2 (problema conocido de `aapt2` daemon en Bionic). Usa la **Opción A** — CI corre en Ubuntu x86_64 y genera el APK limpio.
-
 ---
 
 ## Uso
