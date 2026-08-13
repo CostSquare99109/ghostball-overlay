@@ -13,11 +13,24 @@ import android.view.MotionEvent
 import android.view.View
 
 /**
- * Full-screen transparent overlay. Captures taps to place cue and object balls
- * and renders the best shot suggested by [ShotCalculator].
+ * Overlay drawing surface. Hosts three interaction modes:
  *
- * All drawing uses native `Canvas` — no SVG, no OpenGL. Colors and stroke widths
- * are tuned for legibility over arbitrary app content.
+ *  - [Mode.IDLE]:          not touchable; never receives events.
+ *  - [Mode.PLACEMENT]:     captures taps inside the table rectangle to place
+ *                          cue/object balls; allows corner-handle drag.
+ *  - [Mode.DEFINE_TABLE]:  captures a single drag (down→move→up) that defines
+ *                          the table rectangle.
+ *
+ * All coordinates stored on this view are **screen-absolute** (rawX/rawY). The
+ * owning [OverlayService] sizes this view to either the table rectangle (in
+ * PLACEMENT) or the full screen (in DEFINE_TABLE or while dragging a corner),
+ * and positions it at (rect.left, rect.top). Drawing must therefore subtract
+ * the view's screen origin from absolute coordinates to obtain view-local
+ * canvas coordinates.
+ *
+ * [referencesVisible] is the eye-toggle: when false, balls/lines/ghost are not
+ * painted (but kept in memory), while the table rectangle outline and handles
+ * remain visible. This flag does NOT affect touchability — only [mode] does.
  */
 class OverlayView @JvmOverloads constructor(
     context: Context,
@@ -25,13 +38,42 @@ class OverlayView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    /** Caller-supplied callbacks. */
-    var onRequestStop: (() -> Unit)? = null
-    var onRequestReset: (() -> Unit)? = null
+    enum class Mode { IDLE, PLACEMENT, DEFINE_TABLE }
 
+    /** Callbacks fired to the owning service. */
+    var onTableRectChanged: ((rect: TableConfig.TableRect, interacting: Boolean) -> Unit)? = null
+    var onPlacementNeedsTable: (() -> Unit)? = null
+
+    var mode: Mode = Mode.IDLE
+        set(value) {
+            field = value
+            if (value != Mode.DEFINE_TABLE) {
+                defineStart = null
+                defineCurrent = null
+            }
+            if (value == Mode.IDLE) dragCornerIdx = -1
+            invalidate()
+        }
+
+    /** Eye toggle. When false, drawings (balls/lines/ghost) hide; table rect stays. */
+    var referencesVisible: Boolean = true
+        set(value) { field = value; invalidate() }
+
+    /** Current defined table rectangle (absolute screen px). Loaded by service on startup. */
+    var tableRect: TableConfig.TableRect? = null
+        set(value) { field = value; invalidate() }
+
+    // ---- ball state (absolute screen px) ----
     private var cue: PointF? = null
     private var obj: PointF? = null
     private var bestShot: ShotCalculator.Shot? = null
+
+    // ---- define-table drag (absolute) ----
+    private var defineStart: PointF? = null
+    private var defineCurrent: PointF? = null
+
+    // ---- handle-drag during PLACEMENT ----
+    private var dragCornerIdx: Int = -1
 
     private val config = TableConfig(context)
 
@@ -68,145 +110,347 @@ class OverlayView @JvmOverloads constructor(
     private val pocketFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL; color = Color.parseColor("#AA050505")
     }
+    private val tableOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.argb(200, 201, 162, 39)
+        strokeWidth = dp(1.6f)
+        pathEffect = DashPathEffect(floatArrayOf(dp(8f), dp(4f)), 0f)
+    }
+    private val defineRectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.argb(220, 255, 140, 66)
+        strokeWidth = dp(2.5f)
+    }
+    private val handleFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; color = Color.parseColor("#EAE3D3")
+    }
+    private val handleStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.parseColor("#14100c"); strokeWidth = dp(1.2f)
+    }
 
     private val ballRadius = dp(14f)
+    private val handleHalf = dp(7f)
 
     fun reset() {
         cue = null; obj = null; bestShot = null
         invalidate()
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.action != MotionEvent.ACTION_DOWN) return true
-        val p = PointF(event.x, event.y)
-
-        // Top-left reserved for reset (and stop in the corner).
-        if (p.x < dp(96f) && p.y < dp(96f)) {
-            reset()
-            return true
-        }
-
-        if (cue == null) {
-            cue = p
-            obj = null
-            bestShot = null
-        } else if (obj == null) {
-            obj = p
-            recompute()
-        } else {
-            // Re-place cue first, then on the next tap the object.
-            cue = p
-            obj = null
-            bestShot = null
-        }
+    /** Drop any in-progress drag/define state without saving. */
+    fun cancelGestures() {
+        defineStart = null
+        defineCurrent = null
+        dragCornerIdx = -1
         invalidate()
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (mode) {
+            Mode.IDLE -> return false
+            Mode.DEFINE_TABLE -> handleDefineTouch(event)
+            Mode.PLACEMENT -> handlePlacementTouch(event)
+        }
         return true
     }
 
+    // ---------------- DEFINE_TABLE ----------------
+
+    private fun handleDefineTouch(event: MotionEvent) {
+        val x = event.rawX
+        val y = event.rawY
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                defineStart = PointF(x, y)
+                defineCurrent = PointF(x, y)
+                invalidate()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                defineCurrent = PointF(x, y)
+                invalidate()
+            }
+            MotionEvent.ACTION_UP -> {
+                val s = defineStart
+                val c = defineCurrent
+                defineStart = null
+                defineCurrent = null
+                if (s != null && c != null) {
+                    val left = minOf(s.x, c.x)
+                    val top = minOf(s.y, c.y)
+                    val right = maxOf(s.x, c.x)
+                    val bottom = maxOf(s.y, c.y)
+                    val w = resources.displayMetrics.widthPixels
+                    val h = resources.displayMetrics.heightPixels
+                    if (right - left >= MIN_TABLE_PX && bottom - top >= MIN_TABLE_PX) {
+                        val rect = TableConfig.TableRect(
+                            left = left, top = top, right = right, bottom = bottom,
+                            screenWidth = w, screenHeight = h
+                        )
+                        config.saveTableRect(rect)
+                        tableRect = rect
+                        onTableRectChanged?.invoke(rect, false)
+                    }
+                }
+                invalidate()
+            }
+        }
+    }
+
+    // ---------------- PLACEMENT ----------------
+
+    private fun handlePlacementTouch(event: MotionEvent) {
+        val rect = tableRect
+        if (rect == null) {
+            onPlacementNeedsTable?.invoke()
+            return
+        }
+        val x = event.rawX
+        val y = event.rawY
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                val corner = hitCorner(rect, x, y)
+                if (corner >= 0) {
+                    dragCornerIdx = corner
+                    // Signal expansion to full-screen so outward drag keeps receiving events.
+                    onTableRectChanged?.invoke(rect, true)
+                    invalidate()
+                } else if (rect.contains(x, y)) {
+                    placeBall(rect, x, y)
+                }
+                // Touches outside the rect that get this far (shouldn't, view is sized to rect)
+                // are ignored — return true so we don't break the gesture stream.
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (dragCornerIdx >= 0) {
+                    val moved = moveCorner(rect, dragCornerIdx, x, y)
+                    tableRect = moved
+                    // Keep panel informed while dragging (so it can expand if not yet).
+                    onTableRectChanged?.invoke(moved, true)
+                    invalidate()
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (dragCornerIdx >= 0) {
+                    val moved = tableRect
+                    if (moved != null) config.saveTableRect(moved)
+                    dragCornerIdx = -1
+                    // Signal service to shrink view back to the (new) table rect.
+                    onTableRectChanged?.invoke(moved ?: rect, false)
+                    invalidate()
+                }
+            }
+        }
+    }
+
+    private fun placeBall(rect: TableConfig.TableRect, x: Float, y: Float) {
+        val (cx, cy) = rect.clampPoint(x, y)
+        val p = PointF(cx, cy)
+        if (cue == null) {
+            cue = p; obj = null; bestShot = null
+        } else if (obj == null) {
+            obj = p
+            recompute(rect)
+        } else {
+            // Re-place cue first; next tap will pick the object.
+            cue = p; obj = null; bestShot = null
+        }
+        invalidate()
+    }
+
+    /** Returns corner index [0..3] if (x,y) is within CORNER_HIT_PX of one, else -1. */
+    private fun hitCorner(rect: TableConfig.TableRect, x: Float, y: Float): Int {
+        val r = CORNER_HIT_PX
+        val r2 = r * r
+        val corners = arrayOf(
+            floatArrayOf(rect.left, rect.top),
+            floatArrayOf(rect.right, rect.top),
+            floatArrayOf(rect.left, rect.bottom),
+            floatArrayOf(rect.right, rect.bottom)
+        )
+        for (i in corners.indices) {
+            val dx = x - corners[i][0]
+            val dy = y - corners[i][1]
+            if (dx * dx + dy * dy <= r2) return i
+        }
+        return -1
+    }
+
+    private fun moveCorner(
+        rect: TableConfig.TableRect, idx: Int, x: Float, y: Float
+    ): TableConfig.TableRect {
+        var left = rect.left; var right = rect.right
+        var top = rect.top; var bottom = rect.bottom
+        when (idx) {
+            0 -> { left = x; top = y }
+            1 -> { right = x; top = y }
+            2 -> { left = x; bottom = y }
+            3 -> { right = x; bottom = y }
+        }
+        // If the user drags a corner past the opposite edge, swap to keep rect valid.
+        if (left > right) { val t = left; left = right; right = t }
+        if (top > bottom) { val t = top; top = bottom; bottom = t }
+        val w = resources.displayMetrics.widthPixels
+        val h = resources.displayMetrics.heightPixels
+        return TableConfig.TableRect(
+            left = left.coerceIn(0f, w.toFloat()),
+            top = top.coerceIn(0f, h.toFloat()),
+            right = right.coerceIn(0f, w.toFloat()),
+            bottom = bottom.coerceIn(0f, h.toFloat()),
+            screenWidth = w, screenHeight = h
+        )
+    }
+
+    // ---------------- DRAW ----------------
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        val rect = tableRect
+        val offX = if (mode == Mode.DEFINE_TABLE || dragCornerIdx >= 0) 0f else (rect?.left ?: 0f)
+        val offY = if (mode == Mode.DEFINE_TABLE || dragCornerIdx >= 0) 0f else (rect?.top ?: 0f)
 
-        // Persistent hint at top-center.
-        drawHint(canvas)
+        // 1) In-progress define rectangle (drawn in screen coords, view is full-screen here).
+        if (mode == Mode.DEFINE_TABLE && defineStart != null && defineCurrent != null) {
+            val l = minOf(defineStart!!.x, defineCurrent!!.x)
+            val t = minOf(defineStart!!.y, defineCurrent!!.y)
+            val r = maxOf(defineStart!!.x, defineCurrent!!.x)
+            val b = maxOf(defineStart!!.y, defineCurrent!!.y)
+            canvas.drawRect(l, t, r, b, defineRectPaint)
+            drawDefineHint(canvas)
+        }
 
-        // Draw pockets (visual reference) if user defined them.
+        // 2) Defined table outline + 4 handles. Always drawn when a rect exists.
+        if (rect != null) {
+            val vl = rect.left - offX
+            val vt = rect.top - offY
+            val vr = rect.right - offX
+            val vb = rect.bottom - offY
+            canvas.drawRect(vl, vt, vr, vb, tableOutlinePaint)
+            drawHandle(canvas, vl, vt)
+            drawHandle(canvas, vr, vt)
+            drawHandle(canvas, vl, vb)
+            drawHandle(canvas, vr, vb)
+        }
+
+        // 3) Hint for placement mode without a defined table.
+        if (mode == Mode.PLACEMENT && rect == null) {
+            drawPlacementNeedsTableHint(canvas)
+        }
+
+        // 4) References (balls, lines, ghost, angle label) — hidden when eye off.
+        if (!referencesVisible) return
+
         config.loadPockets()?.forEach { pk ->
-            canvas.drawCircle(pk.x, pk.y, dp(7f), pocketFill)
+            canvas.drawCircle(pk.x - offX, pk.y - offY, dp(7f), pocketFill)
         }
 
         val cueP = cue
         val objP = obj
         val shot = bestShot
 
-        // Trajectory lines first (under balls).
         if (shot != null && cueP != null) {
-            val ghostX: Float; val ghostY: Float
-            when (shot) {
-                is ShotCalculator.Shot.Direct -> {
-                    ghostX = shot.ghostBall.x; ghostY = shot.ghostBall.y
-                    canvas.drawLine(cueP.x, cueP.y, ghostX, ghostY, ghostStroke)
+            drawShot(canvas, shot, cueP, objP, offX, offY)
+        }
+
+        cueP?.let {
+            val x = it.x - offX; val y = it.y - offY
+            canvas.drawCircle(x, y, ballRadius, cueBallFill)
+            canvas.drawCircle(x, y, ballRadius, ballStroke)
+            canvas.drawText("B", x - dp(4f), y - ballRadius - dp(6f), labelText)
+        }
+        objP?.let {
+            val x = it.x - offX; val y = it.y - offY
+            canvas.drawCircle(x, y, ballRadius, objBallFill)
+            canvas.drawCircle(x, y, ballRadius, ballStroke)
+            canvas.drawText("O", x - dp(4f), y - ballRadius - dp(6f), labelText)
+        }
+    }
+
+    private fun drawShot(
+        canvas: Canvas,
+        shot: ShotCalculator.Shot,
+        cueP: PointF,
+        objP: PointF?,
+        offX: Float, offY: Float
+    ) {
+        val cueX = cueP.x - offX; val cueY = cueP.y - offY
+        val ghostX: Float; val ghostY: Float
+        when (shot) {
+            is ShotCalculator.Shot.Direct -> {
+                ghostX = shot.ghostBall.x - offX; ghostY = shot.ghostBall.y - offY
+                canvas.drawLine(cueX, cueY, ghostX, ghostY, ghostStroke)
+                if (objP != null) {
                     canvas.drawLine(
-                        objP!!.x, objP.y,
-                        shot.pocket.x, shot.pocket.y,
+                        objP.x - offX, objP.y - offY,
+                        shot.pocket.x - offX, shot.pocket.y - offY,
                         aimStroke
                     )
                 }
-                is ShotCalculator.Shot.Bank -> {
-                    ghostX = shot.ghostBall.x; ghostY = shot.ghostBall.y
-                    canvas.drawLine(cueP.x, cueP.y, ghostX, ghostY, ghostStroke)
+            }
+            is ShotCalculator.Shot.Bank -> {
+                ghostX = shot.ghostBall.x - offX; ghostY = shot.ghostBall.y - offY
+                canvas.drawLine(cueX, cueY, ghostX, ghostY, ghostStroke)
+                if (objP != null) {
                     canvas.drawLine(
-                        objP!!.x, objP.y,
-                        shot.impactPoint.x, shot.impactPoint.y,
+                        objP.x - offX, objP.y - offY,
+                        shot.impactPoint.x - offX, shot.impactPoint.y - offY,
                         aimStroke
                     )
                     canvas.drawLine(
-                        shot.impactPoint.x, shot.impactPoint.y,
-                        shot.pocket.x, shot.pocket.y,
+                        shot.impactPoint.x - offX, shot.impactPoint.y - offY,
+                        shot.pocket.x - offX, shot.pocket.y - offY,
                         aimStroke
                     )
                     canvas.drawCircle(
-                        shot.impactPoint.x, shot.impactPoint.y,
+                        shot.impactPoint.x - offX, shot.impactPoint.y - offY,
                         dp(3.5f), impactFill
                     )
                 }
             }
-
-            // Ghost ball (dashed outline only, no fill).
-            canvas.drawCircle(ghostX, ghostY, ballRadius, ghostStroke)
-
-            // Floating label with the angle + type.
-            val typeLabel = when (shot) {
-                is ShotCalculator.Shot.Direct -> "DIRECTO"
-                is ShotCalculator.Shot.Bank -> "BANDA · ${railName(shot.rail)}"
-            }
-            val label = "$typeLabel · corte ${"%.1f".format(shot.cutAngleDeg)}°"
-            val textWidth = labelText.measureText(label)
-            val pad = dp(8f)
-            val bgRect = RectF(
-                ghostX - textWidth / 2 - pad,
-                ghostY - ballRadius - dp(36f),
-                ghostX + textWidth / 2 + pad,
-                ghostY - ballRadius - dp(12f)
-            )
-            canvas.drawRoundRect(bgRect, dp(4f), dp(4f), hintBg)
-            canvas.drawText(
-                label,
-                ghostX - textWidth / 2,
-                ghostY - ballRadius - dp(18f),
-                labelText
-            )
         }
 
-        // Balls on top.
-        cueP?.let {
-            canvas.drawCircle(it.x, it.y, ballRadius, cueBallFill)
-            canvas.drawCircle(it.x, it.y, ballRadius, ballStroke)
-            canvas.drawText("B", it.x - dp(4f), it.y - ballRadius - dp(6f), labelText)
+        canvas.drawCircle(ghostX, ghostY, ballRadius, ghostStroke)
+
+        val typeLabel = when (shot) {
+            is ShotCalculator.Shot.Direct -> "DIRECTO"
+            is ShotCalculator.Shot.Bank -> "BANDA · ${railName(shot.rail)}"
         }
-        objP?.let {
-            canvas.drawCircle(it.x, it.y, ballRadius, objBallFill)
-            canvas.drawCircle(it.x, it.y, ballRadius, ballStroke)
-            canvas.drawText("O", it.x - dp(4f), it.y - ballRadius - dp(6f), labelText)
-        }
+        val label = "$typeLabel · corte ${"%.1f".format(shot.cutAngleDeg)}°"
+        val textWidth = labelText.measureText(label)
+        val pad = dp(8f)
+        val bgRect = RectF(
+            ghostX - textWidth / 2 - pad,
+            ghostY - ballRadius - dp(36f),
+            ghostX + textWidth / 2 + pad,
+            ghostY - ballRadius - dp(12f)
+        )
+        canvas.drawRoundRect(bgRect, dp(4f), dp(4f), hintBg)
+        canvas.drawText(label, ghostX - textWidth / 2, ghostY - ballRadius - dp(18f), labelText)
     }
 
-    private fun drawHint(canvas: Canvas) {
-        val hint = when {
-            cue == null -> "Toca para colocar la BOLA BLANCA · esquina sup-izq = reset"
-            obj == null -> "Toca para colocar la BOLA OBJETIVO"
-            else -> "Toca para re-colocar la blanca"
-        }
-        val textWidth = labelText.measureText(hint)
+    private fun drawHandle(canvas: Canvas, x: Float, y: Float) {
+        canvas.drawCircle(x, y, handleHalf, handleFill)
+        canvas.drawCircle(x, y, handleHalf, handleStroke)
+    }
+
+    private fun drawDefineHint(canvas: Canvas) {
+        val hint = "Arrastra para marcar la mesa · suelta para confirmar"
+        drawCenteredHint(canvas, hint, dp(20f))
+    }
+
+    private fun drawPlacementNeedsTableHint(canvas: Canvas) {
+        val hint = "Primero define el área de la mesa (botón M)"
+        drawCenteredHint(canvas, hint, dp(20f))
+    }
+
+    private fun drawCenteredHint(canvas: Canvas, text: String, topY: Float) {
+        val textWidth = labelText.measureText(text)
         val pad = dp(10f)
         val cx = width / 2f
         val bgRect = RectF(
             cx - textWidth / 2 - pad,
-            dp(20f),
+            topY,
             cx + textWidth / 2 + pad,
-            dp(20f) + labelText.textSize + pad
+            topY + labelText.textSize + pad
         )
         canvas.drawRoundRect(bgRect, dp(6f), dp(6f), hintBg)
-        canvas.drawText(hint, cx - textWidth / 2, dp(20f) + labelText.textSize - dp(2f), labelText)
+        canvas.drawText(text, cx - textWidth / 2, topY + labelText.textSize - dp(2f), labelText)
     }
 
     private fun railName(rail: ShotCalculator.Rail) = when (rail) {
@@ -216,15 +460,11 @@ class OverlayView @JvmOverloads constructor(
         ShotCalculator.Rail.RIGHT -> "der."
     }
 
-    private fun recompute() {
+    private fun recompute(rect: TableConfig.TableRect) {
         val cueP = cue ?: return
         val objP = obj ?: return
-
-        val table = ShotCalculator.Rect(0f, 0f, width.toFloat(), height.toFloat())
-
-        val pockets = config.loadPockets()
-            ?: defaultScreenPockets(table)
-
+        val table = ShotCalculator.Rect(rect.left, rect.top, rect.right, rect.bottom)
+        val pockets = config.loadPockets() ?: defaultTablePockets(rect)
         val shots = ShotCalculator.compute(
             cue = ShotCalculator.Point(cueP.x, cueP.y),
             obj = ShotCalculator.Point(objP.x, objP.y),
@@ -234,19 +474,27 @@ class OverlayView @JvmOverloads constructor(
         bestShot = shots.firstOrNull()
     }
 
-    /** 6 pockets mapped to the screen corners + mid-points when user hasn't defined real ones. */
-    private fun defaultScreenPockets(table: ShotCalculator.Rect): List<ShotCalculator.Pocket> {
-        val w = table.width; val h = table.height
+    /** 6 pockets mapped to the table corners + rail mid-points when user hasn't defined any. */
+    private fun defaultTablePockets(rect: TableConfig.TableRect): List<ShotCalculator.Pocket> {
         return listOf(
-            ShotCalculator.Pocket(0f,    0f,    "Esquina sup-izq"),
-            ShotCalculator.Pocket(w,     0f,    "Esquina sup-der"),
-            ShotCalculator.Pocket(0f,    h,     "Esquina inf-izq"),
-            ShotCalculator.Pocket(w,     h,     "Esquina inf-der"),
-            ShotCalculator.Pocket(w / 2, 0f,    "Centro superior"),
-            ShotCalculator.Pocket(w / 2, h,     "Centro inferior"),
+            ShotCalculator.Pocket(rect.left,  rect.top,    "Esquina sup-izq"),
+            ShotCalculator.Pocket(rect.right, rect.top,    "Esquina sup-der"),
+            ShotCalculator.Pocket(rect.left,  rect.bottom, "Esquina inf-izq"),
+            ShotCalculator.Pocket(rect.right, rect.bottom, "Esquina inf-der"),
+            ShotCalculator.Pocket((rect.left + rect.right) / 2, rect.top,    "Centro superior"),
+            ShotCalculator.Pocket((rect.left + rect.right) / 2, rect.bottom, "Centro inferior"),
         )
     }
 
     private fun dp(value: Float): Float =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics)
+
+    /** Hit radius for a corner handle, expressed in **dp** (converted at touch time). */
+    private val cornerHitPx: Float get() = dp(28f)
+
+    /** Minimum table side to accept a define or handle-drag release. */
+    private val minTablePx: Float get() = dp(120f)
+
+    private val MIN_TABLE_PX: Float get() = minTablePx
+    private val CORNER_HIT_PX: Float get() = cornerHitPx
 }
