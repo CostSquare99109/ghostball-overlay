@@ -46,13 +46,14 @@ class ScreenCapture(
         val projection = manager.getMediaProjection(resultCode, data) ?: return
         this.onStopped = onStopped
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            callback = object : MediaProjection.Callback() {
+            val cb = object : MediaProjection.Callback() {
                 override fun onStop() {
                     mediaProjection = null
                     this@ScreenCapture.onStopped?.invoke()
                 }
             }
-            projection.registerCallback(callback, mainHandler)
+            callback = cb
+            projection.registerCallback(cb, mainHandler)
         }
         mediaProjection = projection
     }

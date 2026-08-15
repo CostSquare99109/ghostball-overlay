@@ -184,8 +184,8 @@ class BallDetector(
                 blob.maxY = max(blob.maxY, y)
                 blob.area++
                 val c = image.argb[idx]
-                blob.sumR += (c shr 16) and 0xFFL
-                blob.sumG += (c shr 8) and 0xFFL
+                blob.sumR += ((c shr 16) and 0xFF).toLong()
+                blob.sumG += ((c shr 8) and 0xFF).toLong()
                 blob.sumB += (c and 0xFF).toLong()
                 val (_, s, v) = rgbToHsv((c shr 16) and 0xFF, (c shr 8) and 0xFF, c and 0xFF)
                 blob.sumS += s
@@ -320,9 +320,9 @@ class BallDetector(
                 val base = y * w
                 for (x in x0..x1) {
                     val c = image.argb[base + x]
-                    r += (c shr 16) and 0xFFL
-                    g += (c shr 8) and 0xFFL
-                    b += c and 0xFFL
+                    r += ((c shr 16) and 0xFF).toLong()
+                    g += ((c shr 8) and 0xFF).toLong()
+                    b += (c and 0xFF).toLong()
                     count++
                 }
             }

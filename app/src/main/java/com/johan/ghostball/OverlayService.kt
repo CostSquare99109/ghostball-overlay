@@ -289,8 +289,10 @@ class OverlayService : Service() {
 
         menuDefineBtn = makeMenuBtn("M", "Definir mesa") {
             when (mode) {
-                OverlayView.Mode.IDLE, OverlayView.Mode.PLACEMENT -> applyMode(OverlayView.Mode.DEFINE_TABLE)
-                OverlayView.Mode.DEFINE_TABLE -> applyMode(OverlayView.Mode.PLACEMENT)
+                OverlayView.Mode.IDLE, OverlayView.Mode.PLACEMENT ->
+                    applyMode(OverlayView.Mode.DEFINE_TABLE)
+                OverlayView.Mode.DEFINE_TABLE, OverlayView.Mode.CALIBRATE ->
+                    applyMode(OverlayView.Mode.PLACEMENT)
             }
         }
         menuCalibrateBtn = makeMenuBtn("⊙", "Calibrar radio de bola") {
