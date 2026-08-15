@@ -19,8 +19,9 @@ import kotlin.math.hypot
  *  - [Mode.IDLE]:          not touchable; never receives events.
  *  - [Mode.PLACEMENT]:     captures taps inside the table rectangle to place
  *                          cue/object balls; allows corner-handle drag; also
- *                          hosts detected balls (tap = select objective,
- *                          drag = correct position).
+ *                          hosts detected balls (tap = isolate one target,
+ *                          drag = correct position, v6: all non-cue balls are
+ *                          simultaneous targets computed automatically).
  *  - [Mode.DEFINE_TABLE]:  captures a single drag (down→move→up) that defines
  *                          the table rectangle.
  *  - [Mode.CALIBRATE]:     captures two taps (ball center, then ball edge) to
@@ -45,13 +46,26 @@ class OverlayView @JvmOverloads constructor(
 
     enum class Mode { IDLE, PLACEMENT, DEFINE_TABLE, CALIBRATE }
 
-    /** A detected ball in screen-absolute coordinates. */
-    data class DetectedBallPos(val point: PointF, val isCueBall: Boolean)
+    /**
+     * A detected ball in screen-absolute coordinates.
+     *
+     * [colorIndex] is the palette slot assigned sequentially to every non-cue
+     * ball (in detection order) so targets are visually distinguishable;
+     * `-1` for the cue ball (white is fixed).
+     */
+    data class DetectedBallPos(
+        val point: PointF,
+        val isCueBall: Boolean,
+        val colorIndex: Int = -1
+    )
 
     /** Callbacks fired to the owning service. */
     var onTableRectChanged: ((rect: TableConfig.TableRect, interacting: Boolean) -> Unit)? = null
     var onPlacementNeedsTable: (() -> Unit)? = null
     var onBallRadiusCalibrated: ((radiusPx: Float) -> Unit)? = null
+
+    /** Fired when a target becomes isolated (true) or all targets are shown again (false). */
+    var onIsolationChanged: ((isolated: Boolean) -> Unit)? = null
 
     var mode: Mode = Mode.IDLE
         set(value) {
@@ -80,15 +94,29 @@ class OverlayView @JvmOverloads constructor(
         set(value) { field = value; invalidate() }
 
     // ---- ball state (absolute screen px) ----
+    // Manual mode (no detection): cue + single objective, kept as fallback.
     private var cue: PointF? = null
     private var obj: PointF? = null
     private var bestShot: ShotCalculator.Shot? = null
 
-    // ---- detected balls (v4) ----
+    // ---- detected balls (v4/v6) ----
     private val detectedBalls = mutableListOf<DetectedBallPos>()
     private var dragBallIdx: Int = -1
     private var dragBallMoved: Boolean = false
-    private var objBallIdx: Int = -1
+
+    // ---- v6: multi-target recommendation state ----
+    private var recommendation: TargetRecommender.Recommendation? = null
+
+    /**
+     * While >= 0, only that detected ball's line is drawn (tap-to-isolate).
+     * -1 = all alternatives visible. Setter notifies the service (menu "✶").
+     */
+    var isolatedBallIdx: Int = -1
+        set(value) {
+            field = value
+            invalidate()
+            onIsolationChanged?.invoke(value >= 0)
+        }
 
     /** Calibrated ball radius in px (v4). 0 = not calibrated → manual drawing size. */
     var ballRadiusPx: Float = 0f
@@ -125,9 +153,6 @@ class OverlayView @JvmOverloads constructor(
         style = Paint.Style.STROKE; color = Color.parseColor("#FF8C42")
         strokeWidth = dp(2f); pathEffect = DashPathEffect(floatArrayOf(dp(6f), dp(3f)), 0f)
     }
-    private val impactFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL; color = Color.parseColor("#C9A227")
-    }
     private val labelText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#EAE3D3")
         textSize = dp(12f)
@@ -155,9 +180,6 @@ class OverlayView @JvmOverloads constructor(
     private val handleStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; color = Color.parseColor("#14100c"); strokeWidth = dp(1.2f)
     }
-    private val detectedBallOutline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; color = Color.parseColor("#3FBF6F"); strokeWidth = dp(2f)
-    }
     private val calibMarkerFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL; color = Color.parseColor("#EAE3D3")
     }
@@ -178,23 +200,31 @@ class OverlayView @JvmOverloads constructor(
     fun reset() {
         cue = null; obj = null; bestShot = null
         detectedBalls.clear()
-        objBallIdx = -1; dragBallIdx = -1
+        recommendation = null
+        isolatedBallIdx = -1
+        dragBallIdx = -1
         invalidate()
     }
 
     /**
-     * Replaces the internal detected-ball set. The cue ball is auto-assigned
-     * from the detection (if any was classified); the objective must be tapped
-     * by the user (detection cannot guess the target).
+     * Replaces the internal detected-ball set. v6: every non-cue ball becomes a
+     * simultaneous target; the best shot per target plus the global
+     * recommendation are computed immediately (no user interaction). If the
+     * detector did not classify the cue ball, the user marks it manually by
+     * tapping a detected ball.
      */
     fun setDetectedBalls(balls: List<DetectedBallPos>) {
         detectedBalls.clear()
         detectedBalls.addAll(balls)
         cue = balls.firstOrNull { it.isCueBall }?.point
         obj = null
-        objBallIdx = -1
         bestShot = null
+        recommendation = null
+        isolatedBallIdx = -1
         dragBallIdx = -1
+        if (detectedBalls.any { !it.isCueBall } && cue != null && tableRect != null) {
+            recomputeAll()
+        }
         invalidate()
     }
 
@@ -326,10 +356,8 @@ class OverlayView @JvmOverloads constructor(
                     ball.point.set(cx, cy)
                     if (ball.isCueBall) {
                         cue = ball.point
-                    } else if (objBallIdx == dragBallIdx) {
-                        obj = ball.point
                     }
-                    if (cue != null && obj != null) recompute(rect)
+                    if (cue != null && detectedBalls.any { !it.isCueBall }) recomputeAll(rect)
                     invalidate()
                 } else if (dragCornerIdx >= 0) {
                     val moved = moveCorner(rect, dragCornerIdx, x, y)
@@ -343,13 +371,21 @@ class OverlayView @JvmOverloads constructor(
                 if (dragBallIdx >= 0) {
                     val ball = detectedBalls.getOrNull(dragBallIdx)
                     if (event.action == MotionEvent.ACTION_UP && !dragBallMoved && ball != null) {
-                        if (ball.isCueBall) {
-                            // Tapping the already-marked cue ball does nothing.
-                        } else {
-                            // Tap on a detected ball = select it as the objective.
-                            obj = ball.point
-                            objBallIdx = dragBallIdx
-                            recompute(rect)
+                        when {
+                            // Fallback: detector could not classify the white ball —
+                            // first tap on any detected ball marks it as the cue.
+                            cue == null && !ball.isCueBall -> {
+                                detectedBalls[dragBallIdx] = ball.copy(isCueBall = true)
+                                cue = ball.point
+                                if (detectedBalls.any { !it.isCueBall }) recomputeAll()
+                                isolatedBallIdx = -1
+                            }
+                            // Tap on a target = isolate its line; tap again = all.
+                            cue != null && !ball.isCueBall -> {
+                                isolatedBallIdx =
+                                    if (isolatedBallIdx == dragBallIdx) -1 else dragBallIdx
+                            }
+                            // Tap on the marked cue ball does nothing.
                         }
                     }
                     dragBallIdx = -1
@@ -551,18 +587,27 @@ class OverlayView @JvmOverloads constructor(
         if (!referencesVisible) return
 
         val cueP = cue
-        val objP = obj
-        val shot = bestShot
         val rad = displayBallRadius
 
-        // Detected balls that are neither cue nor objective draw as green outlines.
-        detectedBalls.forEachIndexed { i, b ->
-            if (i == objBallIdx || b.isCueBall) return@forEachIndexed
-            canvas.drawCircle(b.point.x - offX, b.point.y - offY, rad, detectedBallOutline)
-        }
-
-        if (shot != null && cueP != null) {
-            drawShot(canvas, shot, cueP, objP, offX, offY)
+        // Manual mode (no detection) draws the single objective "O".
+        if (detectedBalls.isEmpty()) {
+            val objP = obj
+            val shot = bestShot
+            if (shot != null && cueP != null) {
+                drawShot(
+                    canvas, shot, cueP, objP, offX, offY,
+                    aim = aimStroke, ghost = ghostStroke,
+                    label = shotLabel(shot)
+                )
+            }
+            objP?.let {
+                val x = it.x - offX; val y = it.y - offY
+                canvas.drawCircle(x, y, rad, objBallFill)
+                canvas.drawCircle(x, y, rad, ballStroke)
+                canvas.drawText("O", x - dp(4f), y - rad - dp(6f), labelText)
+            }
+        } else {
+            drawMultiTarget(canvas, cueP, offX, offY, rad)
         }
 
         cueP?.let {
@@ -571,12 +616,96 @@ class OverlayView @JvmOverloads constructor(
             canvas.drawCircle(x, y, rad, ballStroke)
             canvas.drawText("B", x - dp(4f), y - rad - dp(6f), labelText)
         }
-        objP?.let {
-            val x = it.x - offX; val y = it.y - offY
-            canvas.drawCircle(x, y, rad, objBallFill)
-            canvas.drawCircle(x, y, rad, ballStroke)
-            canvas.drawText("O", x - dp(4f), y - rad - dp(6f), labelText)
+    }
+
+    /**
+     * v6 draw: every non-cue detected ball gets its palette color; the best
+     * shot lines are drawn per target (thin, semi-transparent), and the global
+     * recommendation as a thick, fully opaque line labeled "MEJOR OPCIÓN".
+     * When a target is isolated, only that one's line remains.
+     */
+    private fun drawMultiTarget(
+        canvas: Canvas,
+        cueP: PointF?,
+        offX: Float, offY: Float,
+        rad: Float
+    ) {
+        val isolated = isolatedBallIdx
+
+        detectedBalls.forEachIndexed { i, b ->
+            if (b.isCueBall) return@forEachIndexed
+            val outline = ballOutlinePaint(
+                TargetPalette.color(b.colorIndex),
+                strokePx = if (isolated == i) dp(3.2f) else dp(2.2f),
+                alpha = if (isolated >= 0 && isolated != i) 110 else 255
+            )
+            canvas.drawCircle(b.point.x - offX, b.point.y - offY, rad, outline)
         }
+
+        if (cueP == null) {
+            drawCenteredHint(canvas, "Toca la bola blanca para fijarla manualmente", dp(20f))
+            return
+        }
+        if (!detectedBalls.any { !it.isCueBall }) {
+            drawCenteredHint(canvas, "No se detectaron bolas objetivo — usa el modo manual", dp(20f))
+            return
+        }
+        val rec = recommendation ?: return
+
+        rec.perTarget.forEach { ts ->
+            val best = ts.best ?: return@forEach
+            val ball = detectedBalls.firstOrNull { !it.isCueBall && it.colorIndex == ts.colorIndex }
+                ?: return@forEach
+            val i = detectedBalls.indexOf(ball)
+            if (isolated >= 0 && isolated != i) return@forEach
+            val color = TargetPalette.color(ts.colorIndex)
+            if (ts == rec.globalBest) {
+                drawShot(
+                    canvas, best, cueP, ball.point, offX, offY,
+                    aim = mainLinePaint(color), ghost = mainLinePaint(color),
+                    label = "MEJOR OPCIÓN · ${shotLabel(best)}"
+                )
+            } else {
+                drawShot(
+                    canvas, best, cueP, ball.point, offX, offY,
+                    aim = altLinePaint(color), ghost = ghostStroke,
+                    label = null, drawGhostCircle = false
+                )
+            }
+        }
+    }
+
+    private fun ballOutlinePaint(color: Int, strokePx: Float, alpha: Int): Paint =
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            this.color = color
+            strokeWidth = strokePx
+            this.alpha = alpha
+        }
+
+    private fun mainLinePaint(color: Int): Paint =
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            this.color = color
+            alpha = 255
+            strokeWidth = dp(3.5f)
+        }
+
+    private fun altLinePaint(color: Int): Paint =
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            this.color = color
+            alpha = 130
+            strokeWidth = dp(1.4f)
+            pathEffect = DashPathEffect(floatArrayOf(dp(6f), dp(3f)), 0f)
+        }
+
+    private fun shotLabel(shot: ShotCalculator.Shot): String {
+        val type = when (shot) {
+            is ShotCalculator.Shot.Direct -> "DIRECTO"
+            is ShotCalculator.Shot.Bank -> "BANDA · ${railName(shot.rail)}"
+        }
+        return "$type · corte ${"%.1f".format(shot.cutAngleDeg)}°"
     }
 
     private fun drawShot(
@@ -584,61 +713,69 @@ class OverlayView @JvmOverloads constructor(
         shot: ShotCalculator.Shot,
         cueP: PointF,
         objP: PointF?,
-        offX: Float, offY: Float
+        offX: Float, offY: Float,
+        aim: Paint,
+        ghost: Paint,
+        label: String? = null,
+        drawGhostCircle: Boolean = true
     ) {
         val cueX = cueP.x - offX; val cueY = cueP.y - offY
         val ghostX: Float; val ghostY: Float
         when (shot) {
             is ShotCalculator.Shot.Direct -> {
                 ghostX = shot.ghostBall.x - offX; ghostY = shot.ghostBall.y - offY
-                canvas.drawLine(cueX, cueY, ghostX, ghostY, ghostStroke)
+                canvas.drawLine(cueX, cueY, ghostX, ghostY, ghost)
                 if (objP != null) {
                     canvas.drawLine(
                         objP.x - offX, objP.y - offY,
                         shot.pocket.x - offX, shot.pocket.y - offY,
-                        aimStroke
+                        aim
                     )
                 }
             }
             is ShotCalculator.Shot.Bank -> {
                 ghostX = shot.ghostBall.x - offX; ghostY = shot.ghostBall.y - offY
-                canvas.drawLine(cueX, cueY, ghostX, ghostY, ghostStroke)
+                canvas.drawLine(cueX, cueY, ghostX, ghostY, ghost)
                 if (objP != null) {
                     canvas.drawLine(
                         objP.x - offX, objP.y - offY,
                         shot.impactPoint.x - offX, shot.impactPoint.y - offY,
-                        aimStroke
+                        aim
                     )
                     canvas.drawLine(
                         shot.impactPoint.x - offX, shot.impactPoint.y - offY,
                         shot.pocket.x - offX, shot.pocket.y - offY,
-                        aimStroke
+                        aim
                     )
+                    val impactP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        style = Paint.Style.FILL
+                        color = aim.color
+                        alpha = maxOf(60, aim.alpha * 3 / 4)
+                    }
                     canvas.drawCircle(
                         shot.impactPoint.x - offX, shot.impactPoint.y - offY,
-                        dp(3.5f), impactFill
+                        dp(3.5f), impactP
                     )
                 }
             }
         }
 
-        canvas.drawCircle(ghostX, ghostY, displayBallRadius, ghostStroke)
-
-        val typeLabel = when (shot) {
-            is ShotCalculator.Shot.Direct -> "DIRECTO"
-            is ShotCalculator.Shot.Bank -> "BANDA · ${railName(shot.rail)}"
+        if (drawGhostCircle) {
+            canvas.drawCircle(ghostX, ghostY, displayBallRadius, ghostStroke)
         }
-        val label = "$typeLabel · corte ${"%.1f".format(shot.cutAngleDeg)}°"
-        val textWidth = labelText.measureText(label)
-        val pad = dp(8f)
-        val bgRect = RectF(
-            ghostX - textWidth / 2 - pad,
-            ghostY - ballRadius - dp(36f),
-            ghostX + textWidth / 2 + pad,
-            ghostY - ballRadius - dp(12f)
-        )
-        canvas.drawRoundRect(bgRect, dp(4f), dp(4f), hintBg)
-        canvas.drawText(label, ghostX - textWidth / 2, ghostY - ballRadius - dp(18f), labelText)
+
+        if (label != null && objP != null) {
+            val textWidth = labelText.measureText(label)
+            val pad = dp(8f)
+            val bgRect = RectF(
+                ghostX - textWidth / 2 - pad,
+                ghostY - ballRadius - dp(36f),
+                ghostX + textWidth / 2 + pad,
+                ghostY - ballRadius - dp(12f)
+            )
+            canvas.drawRoundRect(bgRect, dp(4f), dp(4f), hintBg)
+            canvas.drawText(label, ghostX - textWidth / 2, ghostY - ballRadius - dp(18f), labelText)
+        }
     }
 
     private fun drawHandle(canvas: Canvas, x: Float, y: Float) {
@@ -689,6 +826,26 @@ class OverlayView @JvmOverloads constructor(
             table = table
         )
         bestShot = shots.firstOrNull()
+    }
+
+    /**
+     * v6: recompute the per-target best shots + global recommendation for every
+     * detected non-cue ball. Safe with zero targets (recommendation is empty).
+     */
+    private fun recomputeAll(rect: TableConfig.TableRect? = null) {
+        val r = rect ?: tableRect ?: return
+        val cueP = cue ?: return
+        val targets = detectedBalls.filter { !it.isCueBall }.map { it.point }
+        if (targets.isEmpty()) {
+            recommendation = TargetRecommender.Recommendation(emptyList(), null)
+            return
+        }
+        recommendation = TargetRecommender.recommend(
+            cue = ShotCalculator.Point(cueP.x, cueP.y),
+            targets = targets.map { ShotCalculator.Point(it.x, it.y) },
+            pockets = config.loadPockets() ?: pocketsFrom(r),
+            table = ShotCalculator.Rect(r.left, r.top, r.right, r.bottom)
+        )
     }
 
     /** 6 pockets derived from a saved table rect (long-side mids). */

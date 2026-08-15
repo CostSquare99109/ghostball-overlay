@@ -17,6 +17,7 @@
 | 🔘 **Botón flotante** | Arrastrable, activa/desactiva el modo dibujo para no bloquear el uso normal del celular. |
 | 🎱 **Definir mesa** | Marca 6 puntos en pantalla = troneras reales de TU mesa; se guardan en `SharedPreferences`. |
 | 🖼️ **Detección automática (v4)** | Captura 1 frame con `MediaProjection`, detecta bolas por color+forma (Kotlin puro, sin OpenCV/NDK). |
+| 🎯 **Multi-objetivo (v6)** | Tras la detección, **todas** las bolas detectadas (menos la blanca) son objetivos simultáneos: cada una en su color, con su mejor tiro calculado y una recomendación global destacada. Sin tocar la pantalla. |
 | 🎯 **Calibración de bola** | 2 toques (centro + borde) definen el radio de bola en px — una vez por juego/resolución. |
 | 🧮 **Geometría pura** | `ShotCalculator.kt` sin deps Android — testeable con JUnit en JVM. |
 | 📦 **Sin cámara / sin ML** | Coordenadas en píxeles de pantalla. No hay homografía ni visión artificial en v1. |
@@ -92,9 +93,10 @@ Por defecto la app usa los **4 bordes + centros de pantalla** como referencia de
 3. Pulsa **`⌖` Detectar**:
    - La primera vez pedirá el permiso de captura de pantalla (`MediaProjection`). Se concede **una vez por sesión** del servicio, no en cada detección.
    - Se captura **un único frame**, se recorta a la mesa y se corre el detector.
-4. Todas las bolas detectadas se dibujan como **círculos verdes**. La bola blanca se marca sola como **B** (brillo alto + saturación baja).
-5. Toca cualquiera de las restantes → queda marcada como **objetivo (O)** y la línea del mejor tiro se recalcula automáticamente.
-6. Si una bola detectada quedó mal ubicada, **arrástrala** para corregirla (misma lógica de drag del modo manual).
+4. Todas las bolas detectadas se dibujan con un **color propio** (paleta fija: rojo, naranja, amarillo, lima, cian, azul, violeta, magenta, rosa, teal — el blanco queda reservado para la bola blanca).
+5. **Sin tocar nada**, cada bola objetivo tiene calculado su mejor tiro (directo o banda) y se dibuja como línea fina semi-transparente en su color. La **línea gruesa "MEJOR OPCIÓN"** es la recomendación global: la bola cuyo tiro tiene el menor score (menor ángulo de corte + penalización de banda).
+6. **Opcional:** toca una bola objetivo para **aislar su línea** (oculta las demás); tócala otra vez o pulsa **✶** en el menú para "ver todas". Si el detector no logró clasificar la bola blanca, toca la blanca entre las detectadas y el pipeline sigue normal.
+7. Si una bola detectada quedó mal ubicada, **arrástrala** para corregirla (misma lógica de drag del modo manual).
 
 > El **modo manual sigue intacto**: sin detectar nada, los toques dentro de la mesa colocan B y O como siempre. La detección es aditiva, no reemplaza nada.
 
@@ -105,7 +107,8 @@ Por defecto la app usa los **4 bordes + centros de pantalla** como referencia de
 | 🎨 **Depende del skin del juego** | Colores/tamaños de bola varían entre apps. El detector usa umbrales configurados en `DetectorConfig` (el primero a ajustar ante falsos positivos es `fillMin`/`fillMax`). |
 | 🧩 **Bolas pegadas o tapadas por UI** | Marcador/botones del juego encima de la mesa pueden generar falsos positivos o bolas fusionadas. El detector es deliberadamente **conservador**: prefiere no detectar antes que fabricar bolas falsas. |
 | ⚙️ **Requiere calibración** | El radio de bola debe calibrarse por juego/resolución. Sin calibrar, `⌖` queda deshabilitado (no falla en silencio). |
-| 🔄 **Blanca sin clasificar** | Si ninguna bola pasa el umbral de "blanca", la detección no aborta: se dibujan las bolas y tocas la blanca manualmente. |
+| 🔄 **Blanca sin clasificar** | Si ninguna bola pasa el umbral de "blanca", la detección no aborta: se dibujan todas las bolas en sus colores y tocas la blanca manualmente — de ahí en adelante el flujo multi-objetivo corre normal. |
+| 🎨 **Colores del overlay ≠ colores reales** | El color asignado a cada bola en el overlay (paleta fija) solo sirve para distinguirlas visualmente; **no** intenta identificar el color real de la bola en el juego. Eso sería un paso adicional de clasificación por color que no está implementado. |
 | 📐 **Orientación fija** | Si rotas la pantalla, el rectángulo de mesa se invalida y hay que re-definirlo/calibrar (igual que en v3). |
 
 **Por eso el modo manual no es un adorno: sigue siendo el respaldo real.**
@@ -135,6 +138,8 @@ app/src/main/java/com/johan/ghostball/
 ├── OverlayService.kt                  // Foreground service + WindowManager + orquestación v4
 ├── OverlayView.kt                     // Canvas + touch + dibujo (manual + bolas detectadas + calibración)
 ├── ShotCalculator.kt                  // Geometría PURA (sin Android deps) — JUnit testeable
+├── TargetRecommender.kt               // Recomendación multi-objetivo PURA (v6) — JUnit testeable
+├── TargetPalette.kt                   // Paleta de colores fija para distinguir bolas objetivo (v6)
 ├── BallDetector.kt                    // Detección PURA (sin Android deps) — JUnit testeable
 ├── ScreenCapture.kt                   // MediaProjection: 1 frame por llamada, sesión persistente
 ├── MediaProjectionPermissionActivity.kt // Activity translúcida para consentimiento de captura
@@ -198,6 +203,12 @@ Casos cubiertos:
 | `rectangularBlob_rejectedByShape` | Iconos/marcadores rectangulares → filtrados. |
 | `tinyNoiseBlob_rejectedByArea` / `oversizedBlob_rejectedByArea` | Ruido y blobs fuera de tamaño → filtrados. |
 | `detect_downscalesLargerThanMaxAnalysisDim` | 800×600 con radio 40 → detecta y mapea centro a coords originales. |
+| `singleTarget_isGlobalBest` | 1 objetivo → es automáticamente la recomendación global. |
+| `threeTargetsKnownAngles_globalBestIsLowestScore` | 3 objetivos con cortes {0°, 11°, 43°} → gana el de 0°. |
+| `equalScores_tieBrokenByLowerColorIndex` | Empate de score → gana el de menor orden de detección. |
+| `cueEqualsTarget_skippedButOthersWork` / `allDegenerate_returnsNullGlobalBest` | Objetivos degenerados se saltan, sin crash; todos degenerados → sin recomendación. |
+| `noTargets_returnsEmptyWithoutCrash` / `emptyPockets_returnsNullGlobalBest` | Casos vacíos → sin crash, null global. |
+| `bankPenalty_prefersDirectWithinPenalty` | TargetRecommender hereda la penalización de banda de ShotCalculator. |
 
 ---
 
@@ -221,5 +232,6 @@ Casos cubiertos:
 - [ ] Tema claro/oscuro automático en overlay.
 - [ ] Vibración háptica al colocar bolas.
 - [ ] Tests de integración con Robolectric (OverlayView + Service).
+- [ ] Limpiar docs: el README dice "+10° de penalización para bandas" pero el código usa `BANK_PENALTY = 20f` — el texto está desactualizado, el cálculo real no cambió.
 
 ---

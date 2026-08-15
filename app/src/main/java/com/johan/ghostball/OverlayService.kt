@@ -58,6 +58,7 @@ class OverlayService : Service() {
     private var menuDetectBtn: Button? = null
     private var menuEyeBtn: Button? = null
     private var menuResetBtn: Button? = null
+    private var menuShowAllBtn: Button? = null
     private var overlayView: OverlayView? = null
 
     // ---- v4: on-demand screenshot detection ----
@@ -114,7 +115,7 @@ class OverlayService : Service() {
         }
         fabView = null; menuView = null; overlayView = null
         menuDefineBtn = null; menuCalibrateBtn = null; menuDetectBtn = null
-        menuEyeBtn = null; menuResetBtn = null
+        menuEyeBtn = null; menuResetBtn = null; menuShowAllBtn = null
         screenCapture?.release()
         screenCapture = null
         super.onDestroy()
@@ -309,12 +310,17 @@ class OverlayService : Service() {
         menuResetBtn = makeMenuBtn("⟲", "Resetear bolas") {
             overlayView?.reset()
         }
+        menuShowAllBtn = makeMenuBtn("✶", "Ver todas las líneas objetivo") {
+            overlayView?.isolatedBallIdx = -1
+        }
+        menuShowAllBtn?.visibility = View.GONE
 
         bar.addView(menuDefineBtn)
         bar.addView(menuCalibrateBtn)
         bar.addView(menuDetectBtn)
         bar.addView(menuEyeBtn)
         bar.addView(menuResetBtn)
+        bar.addView(menuShowAllBtn)
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -361,6 +367,9 @@ class OverlayService : Service() {
                 applyMode(OverlayView.Mode.PLACEMENT)
             }
             referencesVisible = this@OverlayService.referencesVisible
+            onIsolationChanged = { isolated ->
+                menuShowAllBtn?.visibility = if (isolated) View.VISIBLE else View.GONE
+            }
         }
         val params = WindowManager.LayoutParams(
             1, 1,
@@ -637,20 +646,26 @@ class OverlayService : Service() {
         val image = BallImage(w, h, pixels)
 
         val balls = BallDetector(ballRadiusPx = radius, feltColor = null).detect(image)
-        val detected = balls.map {
+        var nextPaletteIdx = 0
+        val detected = balls.map { b ->
+            val isCue = b.isCueBall
+            val ci = if (isCue) -1 else nextPaletteIdx++
             OverlayView.DetectedBallPos(
-                point = PointF(it.x + rect.left, it.y + rect.top),
-                isCueBall = it.isCueBall
+                point = PointF(b.x + rect.left, b.y + rect.top),
+                isCueBall = isCue,
+                colorIndex = ci
             )
         }
         overlayView?.setDetectedBalls(detected)
 
         val cueMarked = detected.count { it.isCueBall }
+        val targetsCount = detected.count { !it.isCueBall }
         toast(
             when {
                 detected.isEmpty() -> "No se detectaron bolas — usa el modo manual"
-                cueMarked > 0 -> "Detectadas ${detected.size} · blanca marcada"
-                else -> "Detectadas ${detected.size} · toca la blanca manualmente"
+                targetsCount == 0 -> "No se detectaron bolas objetivo"
+                cueMarked > 0 -> "Detectadas $targetsCount objetivo(s) · recomendación destacada"
+                else -> "Detectadas $targetsCount objetivo(s) · toca la blanca manualmente"
             }
         )
     }
