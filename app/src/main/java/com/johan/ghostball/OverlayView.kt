@@ -128,6 +128,7 @@ class OverlayView @JvmOverloads constructor(
 
     private val ballRadius = dp(14f)
     private val handleHalf = dp(7f)
+    private val pocketRadius = dp(7f)
 
     fun reset() {
         cue = null; obj = null; bestShot = null
@@ -153,17 +154,27 @@ class OverlayView @JvmOverloads constructor(
 
     // ---------------- DEFINE_TABLE ----------------
 
+    /**
+     * **Single** coordinate mapping for the whole define gesture. Used for:
+     *  - the live preview rectangles on every [MotionEvent.ACTION_MOVE], and
+     *  - saving the final rect + pockets on [MotionEvent.ACTION_UP].
+     *
+     * No other conversion (rawX-delta, px↔dp, etc.) may be applied anywhere in
+     * the flow — the value drawn while dragging must be the exact value persisted.
+     */
+    private fun screenPointFromEvent(event: MotionEvent): PointF =
+        PointF(event.rawX, event.rawY)
+
     private fun handleDefineTouch(event: MotionEvent) {
-        val x = event.rawX
-        val y = event.rawY
+        val p = screenPointFromEvent(event)
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                defineStart = PointF(x, y)
-                defineCurrent = PointF(x, y)
+                defineStart = p
+                defineCurrent = p
                 invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
-                defineCurrent = PointF(x, y)
+                defineCurrent = p
                 invalidate()
             }
             MotionEvent.ACTION_UP -> {
@@ -184,10 +195,24 @@ class OverlayView @JvmOverloads constructor(
                             screenWidth = w, screenHeight = h
                         )
                         config.saveTableRect(rect)
+                        config.savePockets(
+                            ShotCalculator.pocketsFromRect(
+                                ShotCalculator.Point(left, top),
+                                ShotCalculator.Point(right, bottom)
+                            )
+                        )
+                        // Redefining invalidates any previously placed balls.
+                        cue = null; obj = null; bestShot = null
                         tableRect = rect
+                        // Service transitions to PLACEMENT (geometry synced) on this call.
                         onTableRectChanged?.invoke(rect, false)
                     }
                 }
+                invalidate()
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                defineStart = null
+                defineCurrent = null
                 invalidate()
             }
         }
@@ -306,7 +331,8 @@ class OverlayView @JvmOverloads constructor(
         val offY = if (mode == Mode.DEFINE_TABLE || dragCornerIdx >= 0) 0f else (rect?.top ?: 0f)
 
         // 1) In-progress define rectangle (drawn in screen coords, view is full-screen here).
-        if (mode == Mode.DEFINE_TABLE && defineStart != null && defineCurrent != null) {
+        val definingDrag = mode == Mode.DEFINE_TABLE && defineStart != null && defineCurrent != null
+        if (definingDrag) {
             val l = minOf(defineStart!!.x, defineCurrent!!.x)
             val t = minOf(defineStart!!.y, defineCurrent!!.y)
             val r = maxOf(defineStart!!.x, defineCurrent!!.x)
@@ -315,8 +341,10 @@ class OverlayView @JvmOverloads constructor(
             drawDefineHint(canvas)
         }
 
-        // 2) Defined table outline + 4 handles. Always drawn when a rect exists.
-        if (rect != null) {
+        // 2) Defined table outline + 4 handles. Always drawn when a rect exists,
+        //    except while a new define drag is in progress (old rect must not
+        //    linger next to the live preview).
+        if (rect != null && !definingDrag) {
             val vl = rect.left - offX
             val vt = rect.top - offY
             val vr = rect.right - offX
@@ -328,6 +356,15 @@ class OverlayView @JvmOverloads constructor(
             drawHandle(canvas, vr, vb)
         }
 
+        // 2.5) Pockets of the active rect — always visible while defining or
+        //      placing (even with the eye toggle off), so the user can see
+        //      where they were computed.
+        if (mode != Mode.IDLE) {
+            activePockets()?.forEach { pk ->
+                canvas.drawCircle(pk.x - offX, pk.y - offY, pocketRadius, pocketFill)
+            }
+        }
+
         // 3) Hint for placement mode without a defined table.
         if (mode == Mode.PLACEMENT && rect == null) {
             drawPlacementNeedsTableHint(canvas)
@@ -335,10 +372,6 @@ class OverlayView @JvmOverloads constructor(
 
         // 4) References (balls, lines, ghost, angle label) — hidden when eye off.
         if (!referencesVisible) return
-
-        config.loadPockets()?.forEach { pk ->
-            canvas.drawCircle(pk.x - offX, pk.y - offY, dp(7f), pocketFill)
-        }
 
         val cueP = cue
         val objP = obj
@@ -464,7 +497,7 @@ class OverlayView @JvmOverloads constructor(
         val cueP = cue ?: return
         val objP = obj ?: return
         val table = ShotCalculator.Rect(rect.left, rect.top, rect.right, rect.bottom)
-        val pockets = config.loadPockets() ?: defaultTablePockets(rect)
+        val pockets = config.loadPockets() ?: pocketsFrom(rect)
         val shots = ShotCalculator.compute(
             cue = ShotCalculator.Point(cueP.x, cueP.y),
             obj = ShotCalculator.Point(objP.x, objP.y),
@@ -474,16 +507,28 @@ class OverlayView @JvmOverloads constructor(
         bestShot = shots.firstOrNull()
     }
 
-    /** 6 pockets mapped to the table corners + rail mid-points when user hasn't defined any. */
-    private fun defaultTablePockets(rect: TableConfig.TableRect): List<ShotCalculator.Pocket> {
-        return listOf(
-            ShotCalculator.Pocket(rect.left,  rect.top,    "Esquina sup-izq"),
-            ShotCalculator.Pocket(rect.right, rect.top,    "Esquina sup-der"),
-            ShotCalculator.Pocket(rect.left,  rect.bottom, "Esquina inf-izq"),
-            ShotCalculator.Pocket(rect.right, rect.bottom, "Esquina inf-der"),
-            ShotCalculator.Pocket((rect.left + rect.right) / 2, rect.top,    "Centro superior"),
-            ShotCalculator.Pocket((rect.left + rect.right) / 2, rect.bottom, "Centro inferior"),
+    /** 6 pockets derived from a saved table rect (long-side mids). */
+    private fun pocketsFrom(rect: TableConfig.TableRect): List<ShotCalculator.Pocket> =
+        ShotCalculator.pocketsFromRect(
+            ShotCalculator.Point(rect.left, rect.top),
+            ShotCalculator.Point(rect.right, rect.bottom)
         )
+
+    /**
+     * Pockets of the rect currently on screen: the live preview during a define
+     * drag, or the saved rect (auto-computed, persisted) in PLACEMENT.
+     */
+    private fun activePockets(): List<ShotCalculator.Pocket>? {
+        if (mode == Mode.DEFINE_TABLE && defineStart != null && defineCurrent != null) {
+            val s = defineStart!!
+            val c = defineCurrent!!
+            return ShotCalculator.pocketsFromRect(
+                ShotCalculator.Point(minOf(s.x, c.x), minOf(s.y, c.y)),
+                ShotCalculator.Point(maxOf(s.x, c.x), maxOf(s.y, c.y))
+            )
+        }
+        val rect = tableRect ?: return null
+        return config.loadPockets() ?: pocketsFrom(rect)
     }
 
     private fun dp(value: Float): Float =

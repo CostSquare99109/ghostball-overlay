@@ -18,28 +18,29 @@ class TableConfig(context: Context) {
     /** Returns currently-stored pockets, or null if the user hasn't defined any. */
     fun loadPockets(): List<ShotCalculator.Pocket>? {
         val raw = prefs.getString(KEY_POCKETS, null) ?: return null
-        val points = raw.split(';')
+        val parsed = raw.split(';')
             .filter { it.isNotBlank() }
             .mapNotNull { entry ->
                 val parts = entry.split(',')
-                if (parts.size != 2) return@mapNotNull null
+                if (parts.size < 2) return@mapNotNull null
                 val x = parts[0].toFloatOrNull() ?: return@mapNotNull null
                 val y = parts[1].toFloatOrNull() ?: return@mapNotNull null
-                ShotCalculator.Point(x, y)
+                val name = if (parts.size > 2) parts.subList(2, parts.size).joinToString(",") else null
+                Triple(x, y, name)
             }
-        if (points.size != POCKETS_MAX) return null
+        if (parsed.size != POCKETS_MAX) return null
 
-        return points.mapIndexed { idx, p ->
-            ShotCalculator.Pocket(p.x, p.y, defaultName(idx))
+        return parsed.mapIndexed { idx, (x, y, name) ->
+            ShotCalculator.Pocket(x, y, name ?: defaultName(idx))
         }
     }
 
-    /** Saves a full set of pockets, replacing whatever was there. */
+    /** Saves a full set of pockets, replacing whatever was there. Names included. */
     fun savePockets(pockets: List<ShotCalculator.Pocket>) {
         require(pockets.size == POCKETS_MAX) {
             "Need exactly $POCKETS_MAX pockets, got ${pockets.size}"
         }
-        val raw = pockets.joinToString(";") { "${it.x},${it.y}" }
+        val raw = pockets.joinToString(";") { "${it.x},${it.y},${it.name}" }
         prefs.edit { putString(KEY_POCKETS, raw) }
     }
 

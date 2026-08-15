@@ -347,6 +347,11 @@ class OverlayService : Service() {
     private fun onTableRectChanged(rect: TableConfig.TableRect, interacting: Boolean) {
         if (interacting) {
             resizeOverlayTo(fullScreen = true, touchable = true)
+        } else if (mode == OverlayView.Mode.DEFINE_TABLE) {
+            // Define gesture finished: switch to PLACEMENT so view geometry
+            // (origin = rect.left/top) and drawing offsets stay in sync —
+            // the saved rect must render exactly where the preview was.
+            applyMode(OverlayView.Mode.PLACEMENT)
         } else {
             resizeOverlayTo(rect = rect)
         }

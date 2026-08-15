@@ -202,6 +202,46 @@ class ShotCalculatorTest {
     }
 
     @Test
+    fun pocketsFromRect_horizontal_midsOnTopBottom() {
+        val pockets = ShotCalculator.pocketsFromRect(p(100f, 200f), p(600f, 400f))
+        assertEquals("Must return 6 pockets", 6, pockets.size)
+        assertEquals(100f, pockets[0].x, 0.01f); assertEquals(200f, pockets[0].y, 0.01f)
+        assertEquals(600f, pockets[1].x, 0.01f); assertEquals(200f, pockets[1].y, 0.01f)
+        assertEquals(100f, pockets[2].x, 0.01f); assertEquals(400f, pockets[2].y, 0.01f)
+        assertEquals(600f, pockets[3].x, 0.01f); assertEquals(400f, pockets[3].y, 0.01f)
+        assertEquals(350f, pockets[4].x, 0.01f); assertEquals(200f, pockets[4].y, 0.01f)
+        assertEquals(350f, pockets[5].x, 0.01f); assertEquals(400f, pockets[5].y, 0.01f)
+        assertEquals("Media superior", pockets[4].name)
+        assertEquals("Media inferior", pockets[5].name)
+    }
+
+    @Test
+    fun pocketsFromRect_vertical_midsOnLeftRight() {
+        val pockets = ShotCalculator.pocketsFromRect(p(200f, 100f), p(400f, 700f))
+        assertEquals("Must return 6 pockets", 6, pockets.size)
+        assertEquals(200f, pockets[4].x, 0.01f); assertEquals(400f, pockets[4].y, 0.01f)
+        assertEquals(400f, pockets[5].x, 0.01f); assertEquals(400f, pockets[5].y, 0.01f)
+        assertEquals("Media izquierda", pockets[4].name)
+        assertEquals("Media derecha", pockets[5].name)
+    }
+
+    @Test
+    fun pocketsFromRect_swappedCorners_sameResult() {
+        val a = ShotCalculator.pocketsFromRect(p(100f, 200f), p(600f, 400f))
+        val b = ShotCalculator.pocketsFromRect(p(600f, 400f), p(100f, 200f))
+        assertEquals(6, a.size)
+        assertEquals(a, b)
+    }
+
+    @Test
+    fun pocketsFromRect_square_treatedAsHorizontal() {
+        val pockets = ShotCalculator.pocketsFromRect(p(0f, 0f), p(300f, 300f))
+        assertEquals(6, pockets.size)
+        assertEquals(150f, pockets[4].x, 0.01f); assertEquals(0f, pockets[4].y, 0.01f)
+        assertEquals(150f, pockets[5].x, 0.01f); assertEquals(300f, pockets[5].y, 0.01f)
+    }
+
+    @Test
     fun bankShot_rejectsWrongDirection() {
         // If mirror causes impact to go "away" from real pocket, it should be rejected.
         // Cue (100, 100), Obj (200, 100), Pocket (250, 100) — pocket is to the right.

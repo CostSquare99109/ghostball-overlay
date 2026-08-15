@@ -131,6 +131,47 @@ object ShotCalculator {
         val objectToTarget: Float
     )
 
+    /**
+     * Compute the 6 pockets of a pool table from two opposite corners
+     * ([topLeft], [bottomRight]). The two mid-rail pockets are placed on the
+     * **long** side of the table:
+     *  - horizontal (width >= height) → midpoints of the top/bottom rails.
+     *  - vertical (height > width)    → midpoints of the left/right rails.
+     *
+     * Corner order: top-left, top-right, bottom-left, bottom-right, then the
+     * two mid-rail pockets. Angles are normalized regardless of corner input
+     * order (swapped corners produce the same list).
+     */
+    fun pocketsFromRect(topLeft: Point, bottomRight: Point): List<Pocket> {
+        val left = minOf(topLeft.x, bottomRight.x)
+        val right = maxOf(topLeft.x, bottomRight.x)
+        val top = minOf(topLeft.y, bottomRight.y)
+        val bottom = maxOf(topLeft.y, bottomRight.y)
+        val midX = (left + right) / 2f
+        val midY = (top + bottom) / 2f
+
+        val corners = listOf(
+            Pocket(left, top, "Esquina superior izquierda"),
+            Pocket(right, top, "Esquina superior derecha"),
+            Pocket(left, bottom, "Esquina inferior izquierda"),
+            Pocket(right, bottom, "Esquina inferior derecha"),
+        )
+
+        val mids = if (right - left >= bottom - top) {
+            listOf(
+                Pocket(midX, top, "Media superior"),
+                Pocket(midX, bottom, "Media inferior"),
+            )
+        } else {
+            listOf(
+                Pocket(left, midY, "Media izquierda"),
+                Pocket(right, midY, "Media derecha"),
+            )
+        }
+
+        return corners + mids
+    }
+
     /** A rectangular table area; ball/pocket coordinates are inside this. */
     data class Rect(val left: Float, val top: Float, val right: Float, val bottom: Float) {
         val width: Float get() = right - left
