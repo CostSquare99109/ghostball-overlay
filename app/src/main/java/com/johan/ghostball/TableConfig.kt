@@ -111,6 +111,38 @@ class TableConfig(context: Context) {
 
     fun hasTableRect(): Boolean = prefs.contains(KEY_TABLE_LEFT)
 
+    // ============ BALL RADIUS CALIBRATION (v4) ============
+
+    /** Returns stored ball radius if it matches current screen resolution, else null. */
+    fun loadBallRadius(currentWidth: Int, currentHeight: Int): Float? {
+        val radius = prefs.getFloat(KEY_BALL_RADIUS, -1f)
+        if (radius <= 0f) return null
+        val storedWidth = prefs.getInt(KEY_BALL_RADIUS_SCREEN_W, -1)
+        val storedHeight = prefs.getInt(KEY_BALL_RADIUS_SCREEN_H, -1)
+        if (storedWidth != currentWidth || storedHeight != currentHeight) return null
+        return radius
+    }
+
+    /** Saves the calibrated ball radius, associated with the screen size it was calibrated on. */
+    fun saveBallRadius(radius: Float, screenWidth: Int, screenHeight: Int) {
+        prefs.edit {
+            putFloat(KEY_BALL_RADIUS, radius)
+            putInt(KEY_BALL_RADIUS_SCREEN_W, screenWidth)
+            putInt(KEY_BALL_RADIUS_SCREEN_H, screenHeight)
+        }
+    }
+
+    fun clearBallRadius() {
+        prefs.edit {
+            remove(KEY_BALL_RADIUS)
+            remove(KEY_BALL_RADIUS_SCREEN_W)
+            remove(KEY_BALL_RADIUS_SCREEN_H)
+        }
+    }
+
+    fun hasBallRadius(currentWidth: Int, currentHeight: Int): Boolean =
+        loadBallRadius(currentWidth, currentHeight) != null
+
     private fun defaultName(idx: Int): String = when (idx) {
         0 -> "Esquina inf. izq."
         1 -> "Esquina inf. der."
@@ -132,5 +164,9 @@ class TableConfig(context: Context) {
         const val KEY_TABLE_BOTTOM = "table_bottom"
         const val KEY_TABLE_SCREEN_W = "table_screen_w"
         const val KEY_TABLE_SCREEN_H = "table_screen_h"
+        // Ball radius keys
+        const val KEY_BALL_RADIUS = "ball_radius"
+        const val KEY_BALL_RADIUS_SCREEN_W = "ball_radius_screen_w"
+        const val KEY_BALL_RADIUS_SCREEN_H = "ball_radius_screen_h"
     }
 }

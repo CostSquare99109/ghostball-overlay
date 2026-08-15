@@ -1,5 +1,6 @@
 package com.johan.ghostball
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,8 +9,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.PointF
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Handler
@@ -24,6 +27,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.content.IntentCompat
 
 /**
  * Foreground service that hosts three overlay windows:
@@ -50,9 +54,16 @@ class OverlayService : Service() {
     private var fabView: View? = null
     private var menuView: LinearLayout? = null
     private var menuDefineBtn: Button? = null
+    private var menuCalibrateBtn: Button? = null
+    private var menuDetectBtn: Button? = null
     private var menuEyeBtn: Button? = null
     private var menuResetBtn: Button? = null
     private var overlayView: OverlayView? = null
+
+    // ---- v4: on-demand screenshot detection ----
+    private var screenCapture: ScreenCapture? = null
+    private var captureInFlight = false
+    private var activeNotification: Notification? = null
 
     private var mode: OverlayView.Mode = OverlayView.Mode.IDLE
     private var referencesVisible: Boolean = true
@@ -66,6 +77,7 @@ class OverlayService : Service() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         tableConfig = TableConfig(this)
+        screenCapture = ScreenCapture(this, mainHandler)
         startForegroundWithNotification()
         installFab()
         installMenu()
@@ -73,6 +85,7 @@ class OverlayService : Service() {
         // Restore saved table rect & enter IDLE — user must tap FAB to enter PLACEMENT.
         val saved = tableConfig.loadTableRect(screenW, screenH)
         overlayView?.tableRect = saved
+        overlayView?.ballRadiusPx = tableConfig.loadBallRadius(screenW, screenH) ?: 0f
         applyMode(OverlayView.Mode.IDLE)
     }
 
@@ -81,6 +94,15 @@ class OverlayService : Service() {
             ACTION_STOP -> {
                 stopSelf()
                 return START_NOT_STICKY
+            }
+            ACTION_PROJECTION_GRANTED -> {
+                val code = intent.getIntExtra(
+                    EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED
+                )
+                val data: Intent? = IntentCompat.getParcelableExtra(
+                    intent, EXTRA_PROJECTION_RESULT_INTENT, Intent::class.java
+                )
+                onProjectionGranted(code, data)
             }
         }
         return START_STICKY
@@ -91,7 +113,10 @@ class OverlayService : Service() {
             runCatching { windowManager.removeView(v) }
         }
         fabView = null; menuView = null; overlayView = null
-        menuDefineBtn = null; menuEyeBtn = null; menuResetBtn = null
+        menuDefineBtn = null; menuCalibrateBtn = null; menuDetectBtn = null
+        menuEyeBtn = null; menuResetBtn = null
+        screenCapture?.release()
+        screenCapture = null
         super.onDestroy()
     }
 
@@ -135,6 +160,7 @@ class OverlayService : Service() {
             .addAction(R.mipmap.ic_launcher, "Detener", stopIntent)
 
         val notification = builder.build()
+        activeNotification = notification
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -267,6 +293,12 @@ class OverlayService : Service() {
                 OverlayView.Mode.DEFINE_TABLE -> applyMode(OverlayView.Mode.PLACEMENT)
             }
         }
+        menuCalibrateBtn = makeMenuBtn("⊙", "Calibrar radio de bola") {
+            onCalibratePressed()
+        }
+        menuDetectBtn = makeMenuBtn("⌖", "Detectar bolas automáticamente") {
+            onDetectPressed()
+        }
         menuEyeBtn = makeMenuBtn("◉", "Mostrar/ocultar referencias") {
             referencesVisible = !referencesVisible
             overlayView?.referencesVisible = referencesVisible
@@ -277,6 +309,8 @@ class OverlayService : Service() {
         }
 
         bar.addView(menuDefineBtn)
+        bar.addView(menuCalibrateBtn)
+        bar.addView(menuDetectBtn)
         bar.addView(menuEyeBtn)
         bar.addView(menuResetBtn)
 
@@ -317,6 +351,13 @@ class OverlayService : Service() {
         val view = OverlayView(this).apply {
             onTableRectChanged = { rect, interacting -> onTableRectChanged(rect, interacting) }
             onPlacementNeedsTable = { toast("Define primero el área de la mesa") }
+            onBallRadiusCalibrated = { radius ->
+                tableConfig.saveBallRadius(radius, screenW, screenH)
+                overlayView?.ballRadiusPx = radius
+                toast("Radio de bola: ${radius.toInt()} px")
+                refreshDetectEnabled()
+                applyMode(OverlayView.Mode.PLACEMENT)
+            }
             referencesVisible = this@OverlayService.referencesVisible
         }
         val params = WindowManager.LayoutParams(
@@ -439,6 +480,7 @@ class OverlayService : Service() {
                     resizeOverlayTo(rect = null)
                 }
                 menuDefineBtn?.text = "M"
+                refreshDetectEnabled()
             }
             OverlayView.Mode.DEFINE_TABLE -> {
                 fab.text = "M"
@@ -447,7 +489,168 @@ class OverlayService : Service() {
                 resizeOverlayTo(fullScreen = true)
                 applyTouchability(true)
             }
+            OverlayView.Mode.CALIBRATE -> {
+                fab.text = "⊙"
+                fab.setBackgroundColor(Color.parseColor("#CCc9a227"))
+                menuView?.visibility = View.GONE
+                val rect = view.tableRect
+                if (rect != null) {
+                    resizeOverlayTo(rect = rect)
+                    applyTouchability(true)
+                } else {
+                    resizeOverlayTo(rect = null)
+                }
+            }
         }
+    }
+
+    /** ⌖ is only usable once the ball radius has been calibrated (for this screen size). */
+    private fun refreshDetectEnabled() {
+        val btn = menuDetectBtn ?: return
+        val enabled = tableConfig.loadBallRadius(screenW, screenH) != null
+        btn.isEnabled = enabled
+        btn.setTextColor(if (enabled) Color.WHITE else Color.parseColor("#59FAFAFA"))
+    }
+
+    // ========================================================
+    // v4 — ball calibration + automatic detection
+    // ========================================================
+
+    /** ⊙ menu button: enter/leave ball-radius calibration. */
+    private fun onCalibratePressed() {
+        when (mode) {
+            OverlayView.Mode.CALIBRATE -> applyMode(OverlayView.Mode.PLACEMENT)
+            else -> {
+                if (overlayView?.tableRect == null) {
+                    toast("Define primero el área de la mesa (M)")
+                    return
+                }
+                applyMode(OverlayView.Mode.PLACEMENT)
+                applyMode(OverlayView.Mode.CALIBRATE)
+            }
+        }
+    }
+
+    /**
+     * ⌖ menu button: one frame → BallDetector → detected balls on the overlay.
+     * Requires a calibrated ball radius; without it the button stays disabled.
+     */
+    private fun onDetectPressed() {
+        if (tableConfig.loadBallRadius(screenW, screenH) == null) {
+            toast("Calibra el radio de bola primero (⊙)")
+            return
+        }
+        if (mode != OverlayView.Mode.PLACEMENT) applyMode(OverlayView.Mode.PLACEMENT)
+        val capture = screenCapture
+        if (capture != null && capture.isActive) {
+            performDetection()
+        } else {
+            launchProjectionConsent()
+        }
+    }
+
+    private fun launchProjectionConsent() {
+        val intent = Intent(this, MediaProjectionPermissionActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        runCatching { startActivity(intent) }
+            .onFailure { toast("No se pudo pedir el permiso de captura") }
+    }
+
+    private fun onProjectionGranted(resultCode: Int, data: Intent?) {
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            toast("Captura de pantalla no concedida")
+            return
+        }
+        screenCapture?.acquire(resultCode, data, onStopped = {
+            mainHandler.post { toast("El sistema revocó la captura — vuelve a pulsar ⌖") }
+        })
+        upgradeForegroundWithMediaProjection()
+        performDetection()
+    }
+
+    /**
+     * Android 10+ requires the `mediaProjection` bit to be part of the
+     * foreground service type declared at startForeground time. We start as
+     * `specialUse` (overlay) and add `mediaProjection` once consent lands.
+     */
+    private fun upgradeForegroundWithMediaProjection() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val notification = activeNotification ?: return
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        }
+        runCatching { startForeground(NOTIF_ID, notification, type) }
+    }
+
+    /** Screenshot → crop to table rect → downscale → BallDetector → overlay. */
+    private fun performDetection() {
+        if (captureInFlight) return
+        val view = overlayView ?: return
+        val rect = view.tableRect
+            ?: run { toast("Define primero el área de la mesa (M)"); return }
+        val radius = tableConfig.loadBallRadius(screenW, screenH)
+            ?: run { toast("Calibra el radio de bola primero (⊙)"); return }
+        val capture = screenCapture ?: return
+
+        captureInFlight = true
+        capture.captureOneFrame(
+            width = screenW,
+            height = screenH,
+            densityDpi = resources.displayMetrics.densityDpi,
+            onBitmap = { fullBitmap ->
+                val rectNow = view.tableRect
+                if (rectNow == null) {
+                    fullBitmap.recycle()
+                    captureInFlight = false
+                    return@captureOneFrame
+                }
+                runCatching {
+                    applyDetection(fullBitmap, rectNow, radius)
+                }.onFailure {
+                    toast("Fallo al analizar la captura")
+                    fullBitmap.recycle()
+                }
+                captureInFlight = false
+            },
+            onError = { message ->
+                captureInFlight = false
+                toast(message)
+            }
+        )
+    }
+
+    private fun applyDetection(fullBitmap: Bitmap, rect: TableConfig.TableRect, radius: Float) {
+        val left = rect.left.toInt().coerceIn(0, fullBitmap.width - 1)
+        val top = rect.top.toInt().coerceIn(0, fullBitmap.height - 1)
+        val w = rect.width.toInt().coerceIn(1, fullBitmap.width - left)
+        val h = rect.height.toInt().coerceIn(1, fullBitmap.height - top)
+        val cropped = Bitmap.createBitmap(fullBitmap, left, top, w, h)
+        fullBitmap.recycle()
+
+        val pixels = IntArray(w * h)
+        cropped.getPixels(pixels, 0, w, 0, 0, w, h)
+        val image = BallImage(w, h, pixels)
+
+        val balls = BallDetector(ballRadiusPx = radius, feltColor = null).detect(image)
+        val detected = balls.map {
+            OverlayView.DetectedBallPos(
+                point = PointF(it.x + rect.left, it.y + rect.top),
+                isCueBall = it.isCueBall
+            )
+        }
+        overlayView?.setDetectedBalls(detected)
+
+        val cueMarked = detected.count { it.isCueBall }
+        toast(
+            when {
+                detected.isEmpty() -> "No se detectaron bolas — usa el modo manual"
+                cueMarked > 0 -> "Detectadas ${detected.size} · blanca marcada"
+                else -> "Detectadas ${detected.size} · toca la blanca manualmente"
+            }
+        )
     }
 
     private fun toast(text: String) {
@@ -462,6 +665,9 @@ class OverlayService : Service() {
     companion object {
         const val ACTION_STOP = "com.johan.ghostball.action.STOP"
         const val ACTION_TOGGLE = "com.johan.ghostball.action.TOGGLE"
+        const val ACTION_PROJECTION_GRANTED = "com.johan.ghostball.action.PROJECTION_GRANTED"
+        const val EXTRA_PROJECTION_RESULT_CODE = "extra_projection_result_code"
+        const val EXTRA_PROJECTION_RESULT_INTENT = "extra_projection_result_intent"
         const val CHANNEL_ID = "ghostball_overlay_channel"
         const val NOTIF_ID = 4242
     }

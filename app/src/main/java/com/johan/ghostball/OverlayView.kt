@@ -11,22 +11,27 @@ import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
+import kotlin.math.hypot
 
 /**
- * Overlay drawing surface. Hosts three interaction modes:
+ * Overlay drawing surface. Hosts four interaction modes:
  *
  *  - [Mode.IDLE]:          not touchable; never receives events.
  *  - [Mode.PLACEMENT]:     captures taps inside the table rectangle to place
- *                          cue/object balls; allows corner-handle drag.
+ *                          cue/object balls; allows corner-handle drag; also
+ *                          hosts detected balls (tap = select objective,
+ *                          drag = correct position).
  *  - [Mode.DEFINE_TABLE]:  captures a single drag (down→move→up) that defines
  *                          the table rectangle.
+ *  - [Mode.CALIBRATE]:     captures two taps (ball center, then ball edge) to
+ *                          compute the ball radius in px used by detection.
  *
  * All coordinates stored on this view are **screen-absolute** (rawX/rawY). The
  * owning [OverlayService] sizes this view to either the table rectangle (in
- * PLACEMENT) or the full screen (in DEFINE_TABLE or while dragging a corner),
- * and positions it at (rect.left, rect.top). Drawing must therefore subtract
- * the view's screen origin from absolute coordinates to obtain view-local
- * canvas coordinates.
+ * PLACEMENT/CALIBRATE) or the full screen (in DEFINE_TABLE or while dragging a
+ * corner or detected ball), and positions it at (rect.left, rect.top). Drawing
+ * must therefore subtract the view's screen origin from absolute coordinates
+ * to obtain view-local canvas coordinates.
  *
  * [referencesVisible] is the eye-toggle: when false, balls/lines/ghost are not
  * painted (but kept in memory), while the table rectangle outline and handles
@@ -38,11 +43,15 @@ class OverlayView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    enum class Mode { IDLE, PLACEMENT, DEFINE_TABLE }
+    enum class Mode { IDLE, PLACEMENT, DEFINE_TABLE, CALIBRATE }
+
+    /** A detected ball in screen-absolute coordinates. */
+    data class DetectedBallPos(val point: PointF, val isCueBall: Boolean)
 
     /** Callbacks fired to the owning service. */
     var onTableRectChanged: ((rect: TableConfig.TableRect, interacting: Boolean) -> Unit)? = null
     var onPlacementNeedsTable: (() -> Unit)? = null
+    var onBallRadiusCalibrated: ((radiusPx: Float) -> Unit)? = null
 
     var mode: Mode = Mode.IDLE
         set(value) {
@@ -51,7 +60,14 @@ class OverlayView @JvmOverloads constructor(
                 defineStart = null
                 defineCurrent = null
             }
-            if (value == Mode.IDLE) dragCornerIdx = -1
+            if (value != Mode.CALIBRATE) {
+                calibCenter = null
+                calibCurrent = null
+            }
+            if (value == Mode.IDLE) {
+                dragCornerIdx = -1
+                dragBallIdx = -1
+            }
             invalidate()
         }
 
@@ -67,6 +83,20 @@ class OverlayView @JvmOverloads constructor(
     private var cue: PointF? = null
     private var obj: PointF? = null
     private var bestShot: ShotCalculator.Shot? = null
+
+    // ---- detected balls (v4) ----
+    private val detectedBalls = mutableListOf<DetectedBallPos>()
+    private var dragBallIdx: Int = -1
+    private var dragBallMoved: Boolean = false
+    private var objBallIdx: Int = -1
+
+    /** Calibrated ball radius in px (v4). 0 = not calibrated → manual drawing size. */
+    var ballRadiusPx: Float = 0f
+        set(value) { field = value; invalidate() }
+
+    // ---- calibrate-ball gesture (v4) ----
+    private var calibCenter: PointF? = null
+    private var calibCurrent: PointF? = null
 
     // ---- define-table drag (absolute) ----
     private var defineStart: PointF? = null
@@ -125,13 +155,46 @@ class OverlayView @JvmOverloads constructor(
     private val handleStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; color = Color.parseColor("#14100c"); strokeWidth = dp(1.2f)
     }
+    private val detectedBallOutline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.parseColor("#3FBF6F"); strokeWidth = dp(2f)
+    }
+    private val calibMarkerFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; color = Color.parseColor("#EAE3D3")
+    }
+    private val calibMarkerStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.parseColor("#C9A227")
+        strokeWidth = dp(1.6f)
+        pathEffect = DashPathEffect(floatArrayOf(dp(5f), dp(3f)), 0f)
+    }
 
     private val ballRadius = dp(14f)
     private val handleHalf = dp(7f)
     private val pocketRadius = dp(7f)
 
+    /** Radius used to draw balls: calibrated px when available, else the fixed dp default. */
+    private val displayBallRadius: Float
+        get() = if (ballRadiusPx > 0f) ballRadiusPx else ballRadius
+
     fun reset() {
         cue = null; obj = null; bestShot = null
+        detectedBalls.clear()
+        objBallIdx = -1; dragBallIdx = -1
+        invalidate()
+    }
+
+    /**
+     * Replaces the internal detected-ball set. The cue ball is auto-assigned
+     * from the detection (if any was classified); the objective must be tapped
+     * by the user (detection cannot guess the target).
+     */
+    fun setDetectedBalls(balls: List<DetectedBallPos>) {
+        detectedBalls.clear()
+        detectedBalls.addAll(balls)
+        cue = balls.firstOrNull { it.isCueBall }?.point
+        obj = null
+        objBallIdx = -1
+        bestShot = null
+        dragBallIdx = -1
         invalidate()
     }
 
@@ -140,6 +203,7 @@ class OverlayView @JvmOverloads constructor(
         defineStart = null
         defineCurrent = null
         dragCornerIdx = -1
+        dragBallIdx = -1
         invalidate()
     }
 
@@ -148,6 +212,7 @@ class OverlayView @JvmOverloads constructor(
             Mode.IDLE -> return false
             Mode.DEFINE_TABLE -> handleDefineTouch(event)
             Mode.PLACEMENT -> handlePlacementTouch(event)
+            Mode.CALIBRATE -> handleCalibrateTouch(event)
         }
         return true
     }
@@ -236,6 +301,17 @@ class OverlayView @JvmOverloads constructor(
                     // Signal expansion to full-screen so outward drag keeps receiving events.
                     onTableRectChanged?.invoke(rect, true)
                     invalidate()
+                } else if (detectedBalls.isNotEmpty()) {
+                    val ballIdx = hitDetectedBall(x, y)
+                    if (ballIdx >= 0) {
+                        // Touch starts on a detected ball: drag (or tap-to-select on UP).
+                        dragBallIdx = ballIdx
+                        dragBallMoved = false
+                        onTableRectChanged?.invoke(rect, true)
+                        invalidate()
+                    }
+                    // With detection active, empty-area taps do not re-place balls
+                    // manually; drag a detected ball or reset (⟲) to go back to manual.
                 } else if (rect.contains(x, y)) {
                     placeBall(rect, x, y)
                 }
@@ -243,7 +319,19 @@ class OverlayView @JvmOverloads constructor(
                 // are ignored — return true so we don't break the gesture stream.
             }
             MotionEvent.ACTION_MOVE -> {
-                if (dragCornerIdx >= 0) {
+                if (dragBallIdx >= 0) {
+                    val ball = detectedBalls.getOrNull(dragBallIdx) ?: return
+                    dragBallMoved = true
+                    val (cx, cy) = rect.clampPoint(x, y)
+                    ball.point.set(cx, cy)
+                    if (ball.isCueBall) {
+                        cue = ball.point
+                    } else if (objBallIdx == dragBallIdx) {
+                        obj = ball.point
+                    }
+                    if (cue != null && obj != null) recompute(rect)
+                    invalidate()
+                } else if (dragCornerIdx >= 0) {
                     val moved = moveCorner(rect, dragCornerIdx, x, y)
                     tableRect = moved
                     // Keep panel informed while dragging (so it can expand if not yet).
@@ -252,7 +340,23 @@ class OverlayView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (dragCornerIdx >= 0) {
+                if (dragBallIdx >= 0) {
+                    val ball = detectedBalls.getOrNull(dragBallIdx)
+                    if (event.action == MotionEvent.ACTION_UP && !dragBallMoved && ball != null) {
+                        if (ball.isCueBall) {
+                            // Tapping the already-marked cue ball does nothing.
+                        } else {
+                            // Tap on a detected ball = select it as the objective.
+                            obj = ball.point
+                            objBallIdx = dragBallIdx
+                            recompute(rect)
+                        }
+                    }
+                    dragBallIdx = -1
+                    dragBallMoved = false
+                    onTableRectChanged?.invoke(tableRect ?: rect, false)
+                    invalidate()
+                } else if (dragCornerIdx >= 0) {
                     val moved = tableRect
                     if (moved != null) config.saveTableRect(moved)
                     dragCornerIdx = -1
@@ -262,6 +366,59 @@ class OverlayView @JvmOverloads constructor(
                 }
             }
         }
+    }
+
+    // ---------------- CALIBRATE ----------------
+
+    /**
+     * Two taps inside the table: first = ball center, second = ball edge.
+     * The distance between them is the ball radius in px, clamped to a sane
+     * range, then handed to the service via [onBallRadiusCalibrated].
+     */
+    private fun handleCalibrateTouch(event: MotionEvent) {
+        val rect = tableRect
+        if (rect == null) {
+            onPlacementNeedsTable?.invoke()
+            return
+        }
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                val x = event.rawX
+                val y = event.rawY
+                if (!rect.contains(x, y)) return
+                val c = calibCenter
+                if (c == null) {
+                    calibCenter = PointF(x, y)
+                } else {
+                    val p = rect.clampPoint(x, y)
+                    val radius = hypot(p.first - c.x, p.second - c.y)
+                    val clamped = radius.coerceIn(calibMinPx, calibMaxPx)
+                    calibCenter = null
+                    calibCurrent = null
+                    onBallRadiusCalibrated?.invoke(clamped)
+                }
+                invalidate()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (calibCenter != null) {
+                    calibCurrent = PointF(event.rawX, event.rawY)
+                    invalidate()
+                }
+            }
+            else -> calibCurrent = null
+        }
+    }
+
+    /** Index of the detected ball within touch reach of (x,y), else -1. */
+    private fun hitDetectedBall(x: Float, y: Float): Int {
+        val hitR2 = hitRadiusPx * hitRadiusPx
+        for (i in detectedBalls.indices) {
+            val b = detectedBalls[i]
+            val dx = x - b.point.x
+            val dy = y - b.point.y
+            if (dx * dx + dy * dy <= hitR2) return i
+        }
+        return -1
     }
 
     private fun placeBall(rect: TableConfig.TableRect, x: Float, y: Float) {
@@ -370,12 +527,39 @@ class OverlayView @JvmOverloads constructor(
             drawPlacementNeedsTableHint(canvas)
         }
 
+        // 3.5) Calibration markers + hint — interaction feedback, always visible.
+        if (mode == Mode.CALIBRATE) {
+            drawCenteredHint(canvas, "Toca el centro de una bola · luego su borde", dp(20f))
+            calibCenter?.let { c ->
+                val cx = c.x - offX
+                val cy = c.y - offY
+                canvas.drawCircle(cx, cy, dp(4f), calibMarkerFill)
+                val preview = calibCurrent?.let {
+                    val dx = it.x - c.x
+                    val dy = it.y - c.y
+                    hypot(dx, dy)
+                }
+                canvas.drawCircle(
+                    cx, cy,
+                    (preview ?: dp(24f)).coerceIn(calibMinPx, calibMaxPx),
+                    calibMarkerStroke
+                )
+            }
+        }
+
         // 4) References (balls, lines, ghost, angle label) — hidden when eye off.
         if (!referencesVisible) return
 
         val cueP = cue
         val objP = obj
         val shot = bestShot
+        val rad = displayBallRadius
+
+        // Detected balls that are neither cue nor objective draw as green outlines.
+        detectedBalls.forEachIndexed { i, b ->
+            if (i == objBallIdx || b.isCueBall) return@forEachIndexed
+            canvas.drawCircle(b.point.x - offX, b.point.y - offY, rad, detectedBallOutline)
+        }
 
         if (shot != null && cueP != null) {
             drawShot(canvas, shot, cueP, objP, offX, offY)
@@ -383,15 +567,15 @@ class OverlayView @JvmOverloads constructor(
 
         cueP?.let {
             val x = it.x - offX; val y = it.y - offY
-            canvas.drawCircle(x, y, ballRadius, cueBallFill)
-            canvas.drawCircle(x, y, ballRadius, ballStroke)
-            canvas.drawText("B", x - dp(4f), y - ballRadius - dp(6f), labelText)
+            canvas.drawCircle(x, y, rad, cueBallFill)
+            canvas.drawCircle(x, y, rad, ballStroke)
+            canvas.drawText("B", x - dp(4f), y - rad - dp(6f), labelText)
         }
         objP?.let {
             val x = it.x - offX; val y = it.y - offY
-            canvas.drawCircle(x, y, ballRadius, objBallFill)
-            canvas.drawCircle(x, y, ballRadius, ballStroke)
-            canvas.drawText("O", x - dp(4f), y - ballRadius - dp(6f), labelText)
+            canvas.drawCircle(x, y, rad, objBallFill)
+            canvas.drawCircle(x, y, rad, ballStroke)
+            canvas.drawText("O", x - dp(4f), y - rad - dp(6f), labelText)
         }
     }
 
@@ -438,7 +622,7 @@ class OverlayView @JvmOverloads constructor(
             }
         }
 
-        canvas.drawCircle(ghostX, ghostY, ballRadius, ghostStroke)
+        canvas.drawCircle(ghostX, ghostY, displayBallRadius, ghostStroke)
 
         val typeLabel = when (shot) {
             is ShotCalculator.Shot.Direct -> "DIRECTO"
@@ -536,6 +720,13 @@ class OverlayView @JvmOverloads constructor(
 
     /** Hit radius for a corner handle, expressed in **dp** (converted at touch time). */
     private val cornerHitPx: Float get() = dp(28f)
+
+    /** Hit radius for touching/dragging a detected ball (comfortable, ≥ ball size). */
+    private val hitRadiusPx: Float get() = maxOf(ballRadiusPx, dp(28f))
+
+    /** Clamp bounds for the calibrated ball radius. */
+    private val calibMinPx: Float get() = dp(8f)
+    private val calibMaxPx: Float get() = dp(40f)
 
     /** Minimum table side to accept a define or handle-drag release. */
     private val minTablePx: Float get() = dp(120f)

@@ -16,6 +16,8 @@
 | 📱 **Overlay transparente** | `TYPE_APPLICATION_OVERLAY` — dibuja sobre cualquier app sin root. |
 | 🔘 **Botón flotante** | Arrastrable, activa/desactiva el modo dibujo para no bloquear el uso normal del celular. |
 | 🎱 **Definir mesa** | Marca 6 puntos en pantalla = troneras reales de TU mesa; se guardan en `SharedPreferences`. |
+| 🖼️ **Detección automática (v4)** | Captura 1 frame con `MediaProjection`, detecta bolas por color+forma (Kotlin puro, sin OpenCV/NDK). |
+| 🎯 **Calibración de bola** | 2 toques (centro + borde) definen el radio de bola en px — una vez por juego/resolución. |
 | 🧮 **Geometría pura** | `ShotCalculator.kt` sin deps Android — testeable con JUnit en JVM. |
 | 📦 **Sin cámara / sin ML** | Coordenadas en píxeles de pantalla. No hay homografía ni visión artificial en v1. |
 
@@ -26,6 +28,7 @@
 - Android **8.0 (API 26)** o superior.
 - Permiso **“Mostrar sobre otras apps”** (`SYSTEM_ALERT_WINDOW`).
 - Android 13+: permiso **Notificaciones** (`POST_NOTIFICATIONS`).
+- Detección automática (v4): en la **primera** pulsación de `⌖`, Android pide consentimiento de captura de pantalla. Solo se vuelve a pedir si detienes el servicio o revocas el permiso.
 
 ---
 
@@ -78,11 +81,43 @@ Por defecto la app usa los **4 bordes + centros de pantalla** como referencia de
 
 ---
 
+## Detección automática de bolas (v4)
+
+**Escenario soportado:** juego de billar digital en pantalla (no cámara física). La app captura la pantalla bajo demanda, recorta al rectángulo de mesa definido y localiza las bolas por color+forma, todo en **Kotlin puro** (sin OpenCV, sin NDK — el pipeline de CI sigue siendo JVM).
+
+### Flujo de uso
+
+1. **Define la mesa** (botón `M`) — igual que en v3.
+2. **Calibra el radio de bola** (botón `⊙`): toca el *centro* de una bola visible y luego su *borde*. Se guarda asociado a la resolución actual.
+3. Pulsa **`⌖` Detectar**:
+   - La primera vez pedirá el permiso de captura de pantalla (`MediaProjection`). Se concede **una vez por sesión** del servicio, no en cada detección.
+   - Se captura **un único frame**, se recorta a la mesa y se corre el detector.
+4. Todas las bolas detectadas se dibujan como **círculos verdes**. La bola blanca se marca sola como **B** (brillo alto + saturación baja).
+5. Toca cualquiera de las restantes → queda marcada como **objetivo (O)** y la línea del mejor tiro se recalcula automáticamente.
+6. Si una bola detectada quedó mal ubicada, **arrástrala** para corregirla (misma lógica de drag del modo manual).
+
+> El **modo manual sigue intacto**: sin detectar nada, los toques dentro de la mesa colocan B y O como siempre. La detección es aditiva, no reemplaza nada.
+
+### Límites reales (honestidad brutal)
+
+| La detección NO es infalible | Por qué |
+|------------------------------|---------|
+| 🎨 **Depende del skin del juego** | Colores/tamaños de bola varían entre apps. El detector usa umbrales configurados en `DetectorConfig` (el primero a ajustar ante falsos positivos es `fillMin`/`fillMax`). |
+| 🧩 **Bolas pegadas o tapadas por UI** | Marcador/botones del juego encima de la mesa pueden generar falsos positivos o bolas fusionadas. El detector es deliberadamente **conservador**: prefiere no detectar antes que fabricar bolas falsas. |
+| ⚙️ **Requiere calibración** | El radio de bola debe calibrarse por juego/resolución. Sin calibrar, `⌖` queda deshabilitado (no falla en silencio). |
+| 🔄 **Blanca sin clasificar** | Si ninguna bola pasa el umbral de "blanca", la detección no aborta: se dibujan las bolas y tocas la blanca manualmente. |
+| 📐 **Orientación fija** | Si rotas la pantalla, el rectángulo de mesa se invalida y hay que re-definirlo/calibrar (igual que en v3). |
+
+**Por eso el modo manual no es un adorno: sigue siendo el respaldo real.**
+
+---
+
 ## Limitaciones importantes (honestidad brutal)
 
 | Qué NO hace v1.0 | Por qué |
 |------------------|---------|
-| ❌ No detecta la mesa ni las bolas automáticamente | Sin cámara, sin ML, sin visión artificial. Coordenadas = toques del usuario en píxeles de pantalla. |
+| ❌ No detecta la mesa automáticamente | La mesa se define manualmente (botón `M`). Las bolas sí se detectan (v4), con los límites de la sección anterior. |
+| ❌ La detección no reconoce colores ni troneras | Solo localiza bolas por forma/tamaño/color dominante. No distingue "roja" vs "amarilla" ni lee números. |
 | ❌ No corrige perspectiva / homografía | Si grabas la mesa en ángulo, las distancias en píxeles ≠ distancias reales. El ángulo de corte en pantalla **no es** el ángulo real sobre el paño. |
 | ❌ No simula efectos (retroceso, seguimiento, masa) | Solo geometría de choque central (bola fantasma). |
 | ❌ No guarda “perfiles de mesa” con nombres | Solo un set de 6 troneras en `SharedPreferences`. |
@@ -96,14 +131,19 @@ Por defecto la app usa los **4 bordes + centros de pantalla** como referencia de
 
 ```
 app/src/main/java/com/johan/ghostball/
-├── MainActivity.kt        // Permiso overlay + lanza servicio
-├── OverlayService.kt      // Foreground service + WindowManager (2 ventanas)
-├── OverlayView.kt         // Canvas + touch + dibujo de trayectoria
-├── ShotCalculator.kt      // Geometría PURA (sin Android deps) — JUnit testeable
-└── TableConfig.kt         // SharedPreferences para troneras usuario
+├── MainActivity.kt                    // Permiso overlay + lanza servicio
+├── OverlayService.kt                  // Foreground service + WindowManager + orquestación v4
+├── OverlayView.kt                     // Canvas + touch + dibujo (manual + bolas detectadas + calibración)
+├── ShotCalculator.kt                  // Geometría PURA (sin Android deps) — JUnit testeable
+├── BallDetector.kt                    // Detección PURA (sin Android deps) — JUnit testeable
+├── ScreenCapture.kt                   // MediaProjection: 1 frame por llamada, sesión persistente
+├── MediaProjectionPermissionActivity.kt // Activity translúcida para consentimiento de captura
+└── TableConfig.kt                     // SharedPreferences: mesa + troneras + radio de bola
 ```
 
-- **ShotCalculator** es la única clase con lógica matemática. Cero dependencias de Android → corre tests en JVM pura (`./gradlew testDebugUnitTest`).
+- **ShotCalculator** y **BallDetector** son las únicas clases con lógica matemática/visión. Cero dependencias de Android → corren tests en JVM pura (`./gradlew testDebugUnitTest`).
+- **BallDetector** trabaja sobre `BallImage` (IntArray propio) en vez de `Bitmap` — los tests JVM sintetizan píxeles sin Robolectric. `ScreenCapture` adapta `Bitmap` → `BallImage` en runtime.
+- **MediaProjection**: la sesión se pide 1 vez (activity translúcida), se mantiene viva mientras el servicio corre, y cada `⌖` captura un único frame (ImageReader + VirtualDisplay liberados al instante).
 - **OverlayService** mantiene dos `WindowManager` views:
   1. `triggerView` (56 dp, `FLAG_NOT_FOCUSABLE`, arrastrable).
   2. `overlayView` (full-screen, `FLAG_NOT_TOUCHABLE` por defecto; se quita al activar modo dibujo).
@@ -151,6 +191,13 @@ Casos cubiertos:
 | `multiplePockets_returnsSortedByScore` | Ordena por score (menor = mejor). |
 | `bankImpactInsideTableBounds` | Impacto dentro del rectángulo de mesa. |
 | `noShotsWhenCueEqualsObject` | Degenerado → lista vacía. |
+| `whiteBallOnly_isDetectedAndClassifiedAsCue` | Bola blanca sola → 1 detección, marcada cue, centro correcto. |
+| `whitePlusColored_twoBalls_exactlyOneCue` | Blanca + roja → 2 bolas, solo la blanca es cue. |
+| `noBalls_returnsEmptyList` | Paño limpio → lista vacía, sin crash. |
+| `feltColorAutoSampledFromCenter_whenNotSupplied` | Fieltro inferido del centro de la captura. |
+| `rectangularBlob_rejectedByShape` | Iconos/marcadores rectangulares → filtrados. |
+| `tinyNoiseBlob_rejectedByArea` / `oversizedBlob_rejectedByArea` | Ruido y blobs fuera de tamaño → filtrados. |
+| `detect_downscalesLargerThanMaxAnalysisDim` | 800×600 con radio 40 → detecta y mapea centro a coords originales. |
 
 ---
 
@@ -167,8 +214,10 @@ Casos cubiertos:
 
 - [ ] Pantalla “Definir mesa” con 6 toques guiados + labels visuales.
 - [ ] Exportar/importar perfiles de mesa (JSON).
+- [x] Detección automática de bolas por captura de pantalla (v4 — ver sección arriba).
+- [x] Calibración de radio de bola por juego/resolución (v4, 2 toques).
+- [ ] Ajuste fino de umbrales de detección desde la UI (hoy: constantes en `DetectorConfig`).
 - [ ] Modo “calibración con homografía” usando 4 esquinas conocidas (v2.0).
-- [ ] Ajuste de `BALL_RADIUS` en UI (slider) para mesas de distintos tamaños en pantalla.
 - [ ] Tema claro/oscuro automático en overlay.
 - [ ] Vibración háptica al colocar bolas.
 - [ ] Tests de integración con Robolectric (OverlayView + Service).
